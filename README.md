@@ -45,3 +45,13 @@ The workflow builds a **debug APK**, which is suitable for personal testing. For
 ### Live Audio Spectrum (FFT)
 
 The Play Now visualizer uses Android `android.media.audiofx.Visualizer` attached to the Media3 player's audio session and renders 48 logarithmically spaced FFT bands. On first use, tap **Aktifkan analisis spektrum audio** to grant Android's `RECORD_AUDIO` permission. The capture is limited to the app's active playback session; some OEMs/audio routes may block capture, in which case the UI reports that the session is unsupported. The effect is released when playback pauses or the screen leaves the active composition.
+
+
+### Automatic lyrics lookup (local-first)
+
+- Automatically looks up lyrics whenever the current track title or artist changes.
+- Checks the on-device lyrics cache first; the cache is capped at 150 track entries.
+- If there is no local entry, searches LRCLIB over HTTPS on a background IO dispatcher and prefers timestamped/synced lyrics when available.
+- Associates imported and manually selected lyrics with the current track so they are reused locally.
+- Clears stale lyrics when switching to a track with no matching local entry, preventing the previous song's words from being shown while the new lookup runs.
+- Includes a Settings toggle for automatic lookup. Manual search and LRC import/export remain available. An internet connection is required for first-time online lookup, and no service can guarantee lyrics exist for every song.

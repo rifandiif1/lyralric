@@ -58,6 +58,10 @@ import org.json.JSONArray
 import org.json.JSONObject
 import java.util.Locale
 
+private fun lyricsCacheKey(title: String, artist: String): String =
+    (title.trim().substringBeforeLast('.', title.trim()) + "|" + artist.trim())
+        .lowercase(Locale.ROOT).replace(Regex("\\s+"), " ").trim()
+
 private data class AudioTrack(
     val id: String,
     val uri: Uri,
@@ -119,6 +123,8 @@ private fun LyraApp() {
     var results by remember { mutableStateOf<List<LrcResult>>(emptyList()) }
     var lrcText by remember { mutableStateOf(prefs.getString("current_lrc", "").orEmpty()) }
     var currentLyric by remember { mutableStateOf("") }
+    var lyricsStatus by remember { mutableStateOf("Lirik otomatis siap") }
+    var autoLyrics by remember { mutableStateOf(prefs.getBoolean("auto_lyrics", true)) }
     var sleepMinutes by remember { mutableIntStateOf(0) }
     var showSleepDialog by remember { mutableStateOf(false) }
     var smartShuffle by remember { mutableStateOf(prefs.getBoolean("smart_shuffle", true)) }
@@ -206,7 +212,7 @@ private fun LyraApp() {
     val lrcPicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
         if (uri != null) try {
             lrcText = context.contentResolver.openInputStream(uri)?.bufferedReader()?.use { it.readText() }.orEmpty()
-            prefs.edit().putString("current_lrc", lrcText).apply()
+            prefs.edit().putString("current_lrc", lrcText).putString("current_lrc_key", lyricsCacheKey(currentTitle, currentArtist)).apply()
             status = "Berkas LRC berhasil dibuka."
         } catch (e: Exception) { status = "Gagal membuka LRC: ${e.message}" }
     }
@@ -349,6 +355,71 @@ private fun LyraApp() {
             currentLyric = LrcParser.displayLine(lrcText, position)
             LyricsWidgetProvider.updateAll(context, currentTitle, currentLyric)
             delay(500)
+        }
+    }
+
+    LaunchedEffect(currentTitle, currentArtist, autoLyrics) {
+        val title = currentTitle.trim().substringBeforeLast('.', currentTitle.trim())
+        val artist = currentArtist.trim()
+        if (!autoLyrics || title.isBlank() || title == "Belum ada lagu" || title == "Judul tidak diketahui") {
+            if (!autoLyrics) lyricsStatus = "Pencarian lirik otomatis dimatikan"
+            return@LaunchedEffect
+        }
+        val key = lyricsCacheKey(title, artist)
+        // Never leave lyrics from the previous song visible while the new track is being resolved.
+        if (prefs.getString("current_lrc_key", "") != key) {
+            lrcText = ""
+            currentLyric = ""
+            prefs.edit().putString("current_lrc", "").apply()
+        }
+        lyricsStatus = "Memeriksa cache lirik lokal…"
+        val cache = runCatching { JSONObject(prefs.getString("lyrics_cache_json", "{}").orEmpty()) }.getOrElse { JSONObject() }
+        val cached = cache.optString(key, "").takeIf { it.isNotBlank() && it != "null" }
+        if (cached != null) {
+            lrcText = cached
+            prefs.edit().putString("current_lrc", cached).putString("current_lrc_key", key).apply()
+            lyricsStatus = "Lirik ditemukan di cache lokal"
+            return@LaunchedEffect
+        }
+        // Imported or edited lyrics for this exact track also count as local-first results.
+        val savedForCurrentTrack = prefs.getString("current_lrc", "").orEmpty()
+        if (prefs.getString("current_lrc_key", "") == key && savedForCurrentTrack.isNotBlank()) {
+            lrcText = savedForCurrentTrack
+            cache.put(key, savedForCurrentTrack)
+            prefs.edit().putString("lyrics_cache_json", cache.toString()).apply()
+            lyricsStatus = "Lirik lokal ditemukan"
+            return@LaunchedEffect
+        }
+        lyricsStatus = "Mencari lirik otomatis: $title${if (artist.isNotBlank()) " · $artist" else ""}"
+        try {
+            val found = withContext(Dispatchers.IO) {
+                val cleanTitle = title.replace(Regex("(?i)\\s*[-|]\\s*(official\\s*)?(audio|video|lyrics?|visualizer).*?$"), "").trim().ifBlank { title }
+                val cleanArtist = artist.takeUnless { it.isBlank() || it.equals("Artis tidak diketahui", true) || it.equals("unknown", true) || it.equals("<unknown>", true) }.orEmpty()
+                val primary = runCatching { LrclibClient.search(cleanTitle, cleanArtist) }.getOrDefault(emptyList())
+                val candidates = if (primary.isNotEmpty() || cleanArtist.isBlank()) primary else
+                    runCatching { LrclibClient.search(cleanTitle) }.getOrDefault(emptyList())
+                candidates.sortedWith(compareByDescending<LrcResult> { !it.syncedLyrics.isNullOrBlank() }
+                    .thenByDescending { it.name.equals(cleanTitle, true) }
+                    .thenByDescending { cleanArtist.isNotBlank() && it.artist.equals(cleanArtist, true) })
+                    .firstOrNull { !it.syncedLyrics.isNullOrBlank() || !it.plainLyrics.isNullOrBlank() }
+            }
+            if (found != null) {
+                val lyrics = found.syncedLyrics ?: found.plainLyrics.orEmpty()
+                // Ignore a slow result if the user has already moved to another track.
+                if (lyricsCacheKey(currentTitle, currentArtist) == key) {
+                    lrcText = lyrics
+                    val latest = runCatching { JSONObject(prefs.getString("lyrics_cache_json", "{}").orEmpty()) }.getOrElse { JSONObject() }
+                    latest.put(key, lyrics)
+                    while (latest.length() > 150) latest.remove(latest.keys().asSequence().firstOrNull() ?: break)
+                    prefs.edit().putString("lyrics_cache_json", latest.toString()).putString("current_lrc", lyrics).putString("current_lrc_key", key).apply()
+                    results = listOf(found)
+                    lyricsStatus = if (!found.syncedLyrics.isNullOrBlank()) "Lirik tersinkron ditemukan dan disimpan lokal" else "Lirik teks ditemukan dan disimpan lokal"
+                }
+            } else {
+                if (lyricsCacheKey(currentTitle, currentArtist) == key) lyricsStatus = "Lirik tidak ditemukan. Kamu bisa mencari manual atau mengimpor LRC."
+            }
+        } catch (e: Exception) {
+            if (lyricsCacheKey(currentTitle, currentArtist) == key) lyricsStatus = "Pencarian gagal: ${e.message ?: "periksa koneksi internet"}"
         }
     }
 
@@ -629,6 +700,7 @@ private fun LyraApp() {
                         Spacer(Modifier.height(8.dp))
                         Text("Lirik & editor LRC", style = MaterialTheme.typography.headlineMedium, fontWeight = FontWeight.Bold)
                         Text("$currentTitle · $currentArtist", style = MaterialTheme.typography.bodySmall)
+                        Text(lyricsStatus, style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.primary)
                         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                             OutlinedButton(onClick = { searchTrack = currentTitle; searchArtist = currentArtist }) { Text("Gunakan lagu saat ini") }
                             OutlinedButton(onClick = { lrcPicker.launch(arrayOf("text/*", "application/octet-stream")) }) { Text("Buka LRC") }
@@ -649,8 +721,12 @@ private fun LyraApp() {
                             items(results.take(8)) { result ->
                                 ElevatedCard(onClick = {
                                     lrcText = result.syncedLyrics ?: result.plainLyrics.orEmpty()
-                                    prefs.edit().putString("current_lrc", lrcText).apply()
-                                    status = if (result.syncedLyrics != null) "Lirik tersinkron dipilih." else "Lirik teks biasa dipilih."
+                                    val key = lyricsCacheKey(currentTitle, currentArtist)
+                                    val cache = runCatching { JSONObject(prefs.getString("lyrics_cache_json", "{}").orEmpty()) }.getOrElse { JSONObject() }
+                                    cache.put(key, lrcText)
+                                    prefs.edit().putString("current_lrc", lrcText).putString("current_lrc_key", key).putString("lyrics_cache_json", cache.toString()).apply()
+                                    lyricsStatus = if (result.syncedLyrics != null) "Lirik tersinkron dipilih dan disimpan lokal" else "Lirik teks dipilih dan disimpan lokal"
+                                    status = lyricsStatus
                                 }) {
                                     Column(Modifier.padding(10.dp)) {
                                         Text(result.name, fontWeight = FontWeight.SemiBold)
@@ -668,8 +744,12 @@ private fun LyraApp() {
                             OutlinedButton(onClick = { lrcText = LrcParser.shift(lrcText, 500) }) { Text("+0,5s") }
                         }
                         Button(onClick = {
-                            prefs.edit().putString("current_lrc", lrcText).apply()
+                            val key = lyricsCacheKey(currentTitle, currentArtist)
+                            val cache = runCatching { JSONObject(prefs.getString("lyrics_cache_json", "{}").orEmpty()) }.getOrElse { JSONObject() }
+                            cache.put(key, lrcText)
+                            prefs.edit().putString("current_lrc", lrcText).putString("current_lrc_key", key).putString("lyrics_cache_json", cache.toString()).apply()
                             LyricsWidgetProvider.updateAll(context, currentTitle, LrcParser.displayLine(lrcText, position))
+                            lyricsStatus = "Lirik disimpan ke cache lokal"
                             status = "Lirik disimpan."
                         }, modifier = Modifier.fillMaxWidth()) { Text("Simpan lirik") }
                     }
@@ -677,6 +757,7 @@ private fun LyraApp() {
                         Spacer(Modifier.height(10.dp))
                         Text("Pengaturan", style = MaterialTheme.typography.headlineMedium, fontWeight = FontWeight.Bold)
                         SettingRow("Tema gelap", "Gunakan antarmuka gelap", darkMode, { darkMode = it; prefs.edit().putBoolean("dark_mode", it).apply() })
+                        SettingRow("Pencarian lirik otomatis", "Cari lirik saat lagu berubah; gunakan cache lokal sebelum internet", autoLyrics, { autoLyrics = it; prefs.edit().putBoolean("auto_lyrics", it).apply() })
                         ElevatedCard(Modifier.fillMaxWidth().padding(vertical = 5.dp)) {
                             Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                                 Text("Penyimpanan musik", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
