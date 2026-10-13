@@ -4,13 +4,14 @@ data class LyricLine(val timeMs: Long, val text: String)
 
 object LrcParser {
     private val timeRegex = Regex("\\[(\\d{1,3}):(\\d{2})(?:[.:](\\d{1,3}))?]")
+    private val wordTimeRegex = Regex("<\\d{1,3}:\\d{2}(?:[.:]\\d{1,3})?>")
 
     /** Supports multiple timestamps per line, [mm:ss], [mm:ss.d], [mm:ss.dd] and [mm:ss.ddd]. */
     fun parse(lrc: String): List<LyricLine> = lrc.lineSequence().flatMap { rawLine ->
         val line = rawLine.removePrefix("\uFEFF")
         val matches = timeRegex.findAll(line).toList()
         if (matches.isEmpty()) emptySequence() else {
-            val text = timeRegex.replace(line, "").trim()
+            val text = wordTimeRegex.replace(timeRegex.replace(line, ""), "").trim()
             matches.asSequence().mapNotNull { match ->
                 val minutes = match.groupValues[1].toLongOrNull() ?: return@mapNotNull null
                 val seconds = match.groupValues[2].toLongOrNull() ?: return@mapNotNull null

@@ -29,6 +29,7 @@ import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -44,6 +45,7 @@ import androidx.media3.common.MediaMetadata
 import androidx.media3.common.Player
 import androidx.media3.session.MediaController
 import androidx.media3.session.SessionToken
+import com.example.lyraplayer.lyrics.AudioTagEditor
 import com.example.lyraplayer.lyrics.LrcParser
 import com.example.lyraplayer.lyrics.LrclibClient
 import com.example.lyraplayer.lyrics.LrcResult
@@ -106,7 +108,7 @@ private fun LyraApp() {
     var duration by remember { mutableLongStateOf(0L) }
     var currentTitle by remember { mutableStateOf(prefs.getString("current_title", "Belum ada lagu").orEmpty()) }
     var currentArtist by remember { mutableStateOf(prefs.getString("current_artist", "").orEmpty()) }
-    var currentAlbum by remember { mutableStateOf("") }
+    var currentAlbum by remember { mutableStateOf(prefs.getString("current_album", "").orEmpty()) }
     var currentUri by remember { mutableStateOf<Uri?>(null) }
     var shuffle by remember { mutableStateOf(false) }
     var repeatMode by remember { mutableIntStateOf(Player.REPEAT_MODE_OFF) }
@@ -130,6 +132,20 @@ private fun LyraApp() {
     var smartShuffle by remember { mutableStateOf(prefs.getBoolean("smart_shuffle", true)) }
     var lastPlayed by remember { mutableStateOf(prefs.getString("recent_ids", "").orEmpty().split("|").filter { it.isNotBlank() }) }
     var playCounts by remember { mutableStateOf(loadCounts(prefs.getString("play_counts_json", "{}").orEmpty())) }
+    var showMetadataDialog by remember { mutableStateOf(false) }
+    var editTitle by remember { mutableStateOf("") }
+    var editArtist by remember { mutableStateOf("") }
+    var editAlbum by remember { mutableStateOf("") }
+    var editGenre by remember { mutableStateOf("") }
+    var editYear by remember { mutableStateOf("") }
+    var editTrackNumber by remember { mutableStateOf("") }
+    var editComposer by remember { mutableStateOf("") }
+    var editArtworkUri by remember { mutableStateOf<Uri?>(null) }
+    var wordSyncLineIndex by remember { mutableIntStateOf(-1) }
+    var wordSyncWords by remember { mutableStateOf<List<String>>(emptyList()) }
+    var wordSyncEntries by remember { mutableStateOf<List<Pair<Long, String>>>(emptyList()) }
+    var selectedLyricLine by remember { mutableIntStateOf(-1) }
+    var editedLyricLine by remember { mutableStateOf("") }
 
     fun permissionName() = if (Build.VERSION.SDK_INT >= 33) Manifest.permission.READ_MEDIA_AUDIO else Manifest.permission.READ_EXTERNAL_STORAGE
 
@@ -215,6 +231,16 @@ private fun LyraApp() {
             prefs.edit().putString("current_lrc", lrcText).putString("current_lrc_key", lyricsCacheKey(currentTitle, currentArtist)).apply()
             status = "Berkas LRC berhasil dibuka."
         } catch (e: Exception) { status = "Gagal membuka LRC: ${e.message}" }
+    }
+    val artworkPicker = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { uri ->
+        if (uri != null) { editArtworkUri = uri; status = "Sampul dipilih. Simpan metadata untuk menyematkannya ke file audio." }
+    }
+    val tagFilePicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+        if (uri != null) {
+            runCatching { context.contentResolver.takePersistableUriPermission(uri, android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION or android.content.Intent.FLAG_GRANT_WRITE_URI_PERMISSION) }
+            currentUri = uri
+            status = "File audio tujuan metadata dipilih. Pastikan file dapat ditulis."
+        }
     }
     val saveLrcLauncher = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("text/plain")) { uri ->
         if (uri != null) try {
@@ -548,7 +574,7 @@ private fun LyraApp() {
                             Brush.linearGradient(listOf(Color(0xFFB8F36B), Color(0xFF526D36), Color(0xFF171D13))), RoundedCornerShape(28.dp)
                         ), contentAlignment = Alignment.Center) {
                             if (currentTrack?.artworkUri != null) {
-                                AsyncImage(model = currentTrack.artworkUri, contentDescription = "Sampul ${currentTrack.album}", modifier = Modifier.fillMaxSize())
+                                AsyncImage(model = currentTrack.artworkUri, contentDescription = "Sampul ${currentTrack.album}", modifier = Modifier.fillMaxSize(), contentScale = androidx.compose.ui.layout.ContentScale.Crop)
                             } else {
                                 Column(horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.Center) {
                                     Text("♫", style = MaterialTheme.typography.displayLarge, color = Color(0xFF101010), fontWeight = FontWeight.Black)
@@ -564,6 +590,7 @@ private fun LyraApp() {
                                 Text(currentAlbum.ifBlank { "Album tidak diketahui" }, style = MaterialTheme.typography.bodySmall)
                             }
                             IconButton(onClick = { currentTrack?.let { toggleFavorite(it) } }) { Text(if (currentTrack?.id?.let { it in favoriteIds } == true) "♥" else "♡", style = MaterialTheme.typography.headlineSmall) }
+                            IconButton(onClick = { editTitle = currentTitle; editArtist = currentArtist; editAlbum = currentAlbum; editGenre = ""; editYear = ""; editTrackNumber = ""; editComposer = ""; editArtworkUri = null; showMetadataDialog = true }) { Text("✎", style = MaterialTheme.typography.titleLarge) }
                         }
                         if (duration > 0) {
                             Slider(value = position.coerceIn(0L, duration).toFloat(), onValueChange = { position = it.toLong() }, onValueChangeFinished = { controller?.seekTo(position) }, valueRange = 0f..duration.toFloat())
@@ -736,13 +763,87 @@ private fun LyraApp() {
                                 }
                             }
                         }
-                        OutlinedTextField(lrcText, { lrcText = it }, Modifier.weight(1f).fillMaxWidth(), label = { Text("Isi berkas .lrc") })
+                        OutlinedTextField(lrcText, { lrcText = it }, Modifier.weight(1f).fillMaxWidth(), label = { Text("Isi berkas .lrc") }, minLines = 5)
+                        Text("Edit per baris", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
+                        Text("Pilih satu baris untuk mengubah teksnya tanpa mengubah cap waktunya.", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        LazyColumn(Modifier.fillMaxWidth().heightIn(max = 190.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                            items(lrcText.lines().mapIndexedNotNull { index, line -> if (index < 120 && line.isNotBlank()) index to line else null }) { (lineIndex, lyricLine) ->
+                                Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                                    Text(lyricLine.takeWhile { it != ']' }.removePrefix("[").ifBlank { "teks" }, Modifier.width(66.dp), style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.secondary)
+                                    Text(lyricLine.substringAfterLast("]").ifBlank { lyricLine }, Modifier.weight(1f), maxLines = 2, overflow = TextOverflow.Ellipsis, style = MaterialTheme.typography.bodySmall)
+                                    TextButton(onClick = { selectedLyricLine = lineIndex; editedLyricLine = lyricLine.substringAfterLast("]"); if (!lyricLine.contains("]")) editedLyricLine = lyricLine }) { Text("Edit") }
+                                    TextButton(onClick = {
+                                        wordSyncLineIndex = lineIndex
+                                        wordSyncWords = lyricLine.substringAfterLast("]").replace(Regex("<[^>]+>"), "").trim().split(Regex("\\s+")).filter { it.isNotBlank() }
+                                        wordSyncEntries = emptyList()
+                                    }) { Text("Kata") }
+                                }
+                            }
+                        }
+                        if (selectedLyricLine >= 0) {
+                            OutlinedTextField(editedLyricLine, { editedLyricLine = it }, Modifier.fillMaxWidth(), label = { Text("Teks baris terpilih") })
+                            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                Button(onClick = {
+                                    val all = lrcText.lines().toMutableList()
+                                    if (selectedLyricLine in all.indices) {
+                                        val original = all[selectedLyricLine]
+                                        val timestampPrefix = Regex("^(?:\\[[0-9]{2}:[0-9]{2}(?:[.:][0-9]{1,3})?\\])+").find(original)?.value.orEmpty()
+                                        all[selectedLyricLine] = timestampPrefix + editedLyricLine
+                                        lrcText = all.joinToString("\n")
+                                    }
+                                    selectedLyricLine = -1
+                                }) { Text("Terapkan baris") }
+                                TextButton(onClick = { selectedLyricLine = -1 }) { Text("Batal") }
+                            }
+                        }
+                        if (wordSyncLineIndex >= 0) {
+                            ElevatedCard(Modifier.fillMaxWidth()) {
+                                Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                                    Text("Sinkronisasi karaoke per kata", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
+                                    Text("Putar lagu dan tekan cap setiap kali kata berikutnya terdengar. ${wordSyncEntries.size}/${wordSyncWords.size} kata tersinkron.", style = MaterialTheme.typography.bodySmall)
+                                    Text(wordSyncWords.getOrNull(wordSyncEntries.size).orEmpty().ifBlank { "Semua kata selesai" }, style = MaterialTheme.typography.headlineSmall, color = MaterialTheme.colorScheme.primary)
+                                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                        Button(enabled = wordSyncEntries.size < wordSyncWords.size, onClick = {
+                                            wordSyncEntries = wordSyncEntries + (position to wordSyncWords[wordSyncEntries.size])
+                                        }) { Text("Cap kata @ ${formatTime(position)}") }
+                                        TextButton(onClick = { wordSyncLineIndex = -1; wordSyncWords = emptyList(); wordSyncEntries = emptyList() }) { Text("Batal") }
+                                    }
+                                    Button(enabled = wordSyncEntries.size == wordSyncWords.size && wordSyncWords.isNotEmpty(), onClick = {
+                                        val all = lrcText.lines().toMutableList()
+                                        if (wordSyncLineIndex in all.indices) {
+                                            val original = all[wordSyncLineIndex]
+                                            val prefix = Regex("^(?:\\[[0-9]{2,3}:[0-9]{2}(?:[.:][0-9]{1,3})?])+").find(original)?.value.orEmpty()
+                                                .ifBlank { LrcParser.timestamp(wordSyncEntries.firstOrNull()?.first ?: position) }
+                                            val enhanced = wordSyncEntries.joinToString(" ") { (ms, word) ->
+                                                val safe = ms.coerceAtLeast(0L); "<%02d:%02d.%02d>%s".format(Locale.ROOT, safe / 60000, (safe / 1000) % 60, (safe % 1000) / 10, word)
+                                            }
+                                            all[wordSyncLineIndex] = "$prefix $enhanced"
+                                            lrcText = all.joinToString("\n")
+                                        }
+                                        wordSyncLineIndex = -1; wordSyncWords = emptyList(); wordSyncEntries = emptyList()
+                                    }, modifier = Modifier.fillMaxWidth()) { Text("Terapkan cap waktu kata") }
+                                }
+                            }
+                        }
                         Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                             OutlinedButton(onClick = { saveLrcLauncher.launch(currentTitle.substringBeforeLast('.', currentTitle) + ".lrc") }) { Text("Ekspor") }
                             OutlinedButton(onClick = { lrcText = (lrcText.trimEnd() + "\n" + LrcParser.timestamp(position) + " ").trimStart() }) { Text("Cap waktu") }
                             OutlinedButton(onClick = { lrcText = LrcParser.shift(lrcText, -500) }) { Text("−0,5s") }
                             OutlinedButton(onClick = { lrcText = LrcParser.shift(lrcText, 500) }) { Text("+0,5s") }
                         }
+                        OutlinedButton(onClick = {
+                            val uri = currentUri
+                            if (uri == null) {
+                                lyricsStatus = "Putar atau pilih lagu terlebih dahulu."
+                            } else {
+                                lyricsStatus = "Menanamkan lirik ke tag audio…"
+                                scope.launch {
+                                    val result = runCatching { withContext(Dispatchers.IO) { AudioTagEditor.embedLyrics(context, uri, lrcText) } }
+                                    lyricsStatus = if (result.isSuccess) "Lirik berhasil ditanamkan ke tag file audio." else "Gagal menanamkan lirik: ${result.exceptionOrNull()?.message ?: "format tidak didukung atau file tidak bisa ditulis"}"
+                                    status = lyricsStatus
+                                }
+                            }
+                        }, modifier = Modifier.fillMaxWidth()) { Text("Tanamkan lirik ke file audio") }
                         Button(onClick = {
                             val key = lyricsCacheKey(currentTitle, currentArtist)
                             val cache = runCatching { JSONObject(prefs.getString("lyrics_cache_json", "{}").orEmpty()) }.getOrElse { JSONObject() }
@@ -827,11 +928,67 @@ private fun LyraApp() {
                                 if (top.isNotEmpty()) top.forEach { Text("• $it", style = MaterialTheme.typography.bodySmall) }
                             }
                         }
-                        Text("Catatan: dukungan equalizer dan bass boost bergantung perangkat. Visualizer visual saat ini adalah animasi playback; analisis spektrum real-time memerlukan izin dan pengujian tambahan pada perangkat.", style = MaterialTheme.typography.bodySmall, modifier = Modifier.padding(vertical = 12.dp))
+                        Text("Catatan: FFT real-time memerlukan izin mikrofon dan dukungan efek audio perangkat. Jika FFT gagal, visualizer menggunakan animasi fallback. Penyematan lirik memakai tag audio dan dapat gagal jika format tidak didukung atau file hanya-baca.", style = MaterialTheme.typography.bodySmall, modifier = Modifier.padding(vertical = 12.dp))
                     }
                 }
             }
         }
+    }
+
+    if (showMetadataDialog) {
+        AlertDialog(
+            onDismissRequest = { showMetadataDialog = false },
+            title = { Text("Edit metadata lagu") },
+            text = {
+                Column(Modifier.heightIn(max = 520.dp).verticalScroll(androidx.compose.foundation.rememberScrollState()), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text("Simpan perubahan ke tag file audio. Jika Android menolak penulisan, pilih file audio asli dengan tombol Pilih file.", style = MaterialTheme.typography.bodySmall)
+                    OutlinedTextField(editTitle, { editTitle = it }, label = { Text("Judul lagu") }, singleLine = true)
+                    OutlinedTextField(editArtist, { editArtist = it }, label = { Text("Artis") }, singleLine = true)
+                    OutlinedTextField(editAlbum, { editAlbum = it }, label = { Text("Album") }, singleLine = true)
+                    OutlinedTextField(editGenre, { editGenre = it }, label = { Text("Genre") }, singleLine = true)
+                    OutlinedTextField(editYear, { editYear = it.filter(Char::isDigit).take(4) }, label = { Text("Tahun") }, singleLine = true)
+                    OutlinedTextField(editTrackNumber, { editTrackNumber = it.filter(Char::isDigit).take(3) }, label = { Text("Nomor trek") }, singleLine = true)
+                    OutlinedTextField(editComposer, { editComposer = it }, label = { Text("Komposer") }, singleLine = true)
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        OutlinedButton(onClick = { artworkPicker.launch("image/*") }) { Text(if (editArtworkUri == null) "Pilih sampul" else "Ganti sampul") }
+                        OutlinedButton(onClick = { tagFilePicker.launch(arrayOf("audio/*")) }) { Text("Pilih file") }
+                    }
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    val title = editTitle.trim().ifBlank { currentTitle }
+                    val artist = editArtist.trim().ifBlank { "Artis tidak diketahui" }
+                    val album = editAlbum.trim().ifBlank { "Album tidak diketahui" }
+                    val uri = currentUri
+                    scope.launch {
+                        val result = if (uri == null) Result.failure(IllegalStateException("Pilih atau putar file audio terlebih dahulu")) else runCatching {
+                            withContext(Dispatchers.IO) {
+                                AudioTagEditor.write(context, uri, AudioTagEditor.Metadata(
+                                    title = title, artist = artist, album = album, genre = editGenre,
+                                    year = editYear, track = editTrackNumber, composer = editComposer,
+                                    artworkUri = editArtworkUri
+                                ))
+                            }
+                        }
+                        currentTitle = title; currentArtist = artist; currentAlbum = album
+                        songs = songs.map { song -> if (song.uri == uri) song.copy(title = title, artist = artist, album = album, artworkUri = editArtworkUri ?: song.artworkUri) else song }
+                        prefs.edit().putString("current_title", title).putString("current_artist", artist).putString("current_album", album).apply()
+                        val c = controller
+                        val idx = c?.currentMediaItemIndex ?: -1
+                        if (c != null && idx >= 0 && idx < c.mediaItemCount) {
+                            val old = c.getMediaItemAt(idx)
+                            val updated = old.buildUpon().setMediaMetadata(old.mediaMetadata.buildUpon().setTitle(title).setArtist(artist).setAlbumTitle(album).setArtworkUri(editArtworkUri ?: old.mediaMetadata.artworkUri).build()).build()
+                            c.replaceMediaItem(idx, updated)
+                        }
+                        searchTrack = title; searchArtist = artist
+                        showMetadataDialog = false
+                        status = if (result.isSuccess) "Metadata berhasil ditulis ke file audio." else "Metadata tampilan diperbarui, tetapi penulisan file gagal: ${result.exceptionOrNull()?.message ?: "file tidak dapat ditulis"}"
+                    }
+                }) { Text("Simpan metadata") }
+            },
+            dismissButton = { TextButton(onClick = { showMetadataDialog = false }) { Text("Batal") } }
+        )
     }
 
     if (showCreatePlaylist) {
@@ -975,12 +1132,14 @@ private fun AudioVisualizer(audioSessionId: Int, isPlaying: Boolean, modifier: M
     val permissionLauncher = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
         hasPermission = granted
     }
-    var spectrum by remember(audioSessionId) { mutableStateOf(List(48) { 0.06f }) }
+    var spectrum by remember(audioSessionId) { mutableStateOf(List(48) { 0.10f }) }
     var captureError by remember(audioSessionId) { mutableStateOf(false) }
+    var fftReceived by remember(audioSessionId) { mutableStateOf(false) }
 
     DisposableEffect(audioSessionId, isPlaying, hasPermission) {
         var visualizer: Visualizer? = null
         val mainHandler = Handler(Looper.getMainLooper())
+        fftReceived = false
         if (audioSessionId > 0 && isPlaying && hasPermission) {
             try {
                 val capture = Visualizer(audioSessionId)
@@ -1005,7 +1164,7 @@ private fun AudioVisualizer(audioSessionId: Int, isPlaying: Boolean, modifier: M
                             }
                             values[i] = (kotlin.math.ln(1.0 + peak) / kotlin.math.ln(1.0 + 180.0)).toFloat().coerceIn(0.04f, 1f)
                         }
-                        mainHandler.post { spectrum = values }
+                        mainHandler.post { spectrum = values; fftReceived = true }
                     }
                 }, Visualizer.getMaxCaptureRate() / 2, false, true)
                 capture.enabled = true
@@ -1027,14 +1186,25 @@ private fun AudioVisualizer(audioSessionId: Int, isPlaying: Boolean, modifier: M
         }
     }
 
+    val infinite = androidx.compose.animation.core.rememberInfiniteTransition(label = "visualizerMotion")
+    val phase by infinite.animateFloat(
+        initialValue = 0f, targetValue = (2.0 * Math.PI).toFloat(),
+        animationSpec = androidx.compose.animation.core.infiniteRepeatable(
+            animation = androidx.compose.animation.core.tween(950, easing = androidx.compose.animation.core.LinearEasing)
+        ), label = "visualizerPhase"
+    )
+    val needsFallback = !hasPermission || captureError || audioSessionId <= 0 || (isPlaying && !fftReceived)
+    val renderSpectrum = if (needsFallback && isPlaying) List(48) { i ->
+        (0.08f + 0.78f * kotlin.math.abs(kotlin.math.sin(phase + i * 0.42f)) * (0.35f + 0.65f * kotlin.math.abs(kotlin.math.sin(phase * 0.63f + i * 0.13f)))).coerceIn(0.05f, 0.95f)
+    } else if (!isPlaying) List(48) { i -> 0.035f + 0.025f * kotlin.math.abs(kotlin.math.sin(i * 0.3f)) } else spectrum
     Column(modifier, verticalArrangement = Arrangement.spacedBy(5.dp)) {
         Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.SpaceBetween) {
             Text("LIVE AUDIO SPECTRUM", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.primary, fontWeight = FontWeight.Bold)
             Text(when {
-                !hasPermission -> "Perlu izin analisis audio"
-                captureError -> "Spektrum tidak didukung sesi ini"
+                !hasPermission -> "Animasi fallback · izin analisis belum diberikan"
+                captureError || audioSessionId <= 0 -> "Animasi fallback · FFT tidak tersedia"
                 isPlaying -> "REAL-TIME FFT"
-                else -> "MENUNGGU AUDIO"
+                else -> "SIAP SAAT MUSIK DIPUTAR"
             }, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
         }
         if (!hasPermission) {
@@ -1043,11 +1213,11 @@ private fun AudioVisualizer(audioSessionId: Int, isPlaying: Boolean, modifier: M
             }
         }
         Canvas(Modifier.fillMaxWidth().height(66.dp)) {
-            val count = spectrum.size
+            val count = renderSpectrum.size
             val gap = 2.2f
             val barWidth = ((size.width - gap * (count - 1)) / count).coerceAtLeast(1f)
             for (i in 0 until count) {
-                val h = size.height * spectrum[i].coerceIn(0.035f, 1f)
+                val h = size.height * renderSpectrum[i].coerceIn(0.035f, 1f)
                 val x = i * (barWidth + gap)
                 drawRoundRect(
                     brush = Brush.verticalGradient(listOf(Color(0xFFD9FF9A), Color(0xFF8FE03C), Color(0xFF315B18))),
