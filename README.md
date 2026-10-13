@@ -49,3 +49,7 @@ A ZIP is a project archive, not an Android application package. A website that c
 - `lyrics/LrcParser.kt` — timestamp parsing, current-line lookup, timestamp shifting, and plain-text fallback.
 - `playback/PlaybackService.kt` — background playback and lyric-widget refresh.
 - `widget/LyricsWidgetProvider.kt` — Android home-screen widget.
+
+
+## GitHub Actions build fix
+The included workflow does not require `gradlew`; it installs Gradle on the cloud runner and automatically finds the folder containing `settings.gradle.kts`. Upload the contents of this project to your repository, or keep the project inside a subfolder. In GitHub, open Actions → Build Lyra Player APK → Run workflow. Download the APK from the workflow run's Artifacts section if the build succeeds.
