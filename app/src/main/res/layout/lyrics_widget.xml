@@ -1,0 +1,10 @@
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:id="@+id/widget_root"
+    android:layout_width="match_parent" android:layout_height="match_parent"
+    android:orientation="vertical" android:padding="12dp"
+    android:background="#E61B1B24">
+    <TextView android:id="@+id/widget_title" android:layout_width="match_parent" android:layout_height="wrap_content"
+        android:text="Lyra Player" android:textColor="#FFFFFFFF" android:textStyle="bold" android:maxLines="1" android:textSize="14sp" />
+    <TextView android:id="@+id/widget_lyric" android:layout_width="match_parent" android:layout_height="wrap_content"
+        android:text="Pilih lagu untuk menampilkan lirik" android:textColor="#FFE8E6F0" android:maxLines="3" android:textSize="13sp" android:paddingTop="6dp" />
+</LinearLayout>
