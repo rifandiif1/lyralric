@@ -6,9 +6,10 @@ This project is an Android local-music-player foundation with an integrated LRC 
 - Local audio library via Android MediaStore.
 - Optional user-selected folder scan using Android's Storage Access Framework.
 - Search across title, artist, album, and folder.
-- Home overview, library, search, playlists, Now Playing, queue, lyrics, and settings sections.
-- Dedicated Spotify-inspired Now Playing screen with embedded album-art extraction, track/artist/album details, playback controls, synchronized lyric highlighting and auto-scroll.
-- Animated decorative visualizer bars on the Now Playing screen (visual animation only; not a true audio spectrum analyzer).
+- Home overview, library, search, full Now Playing screen, playlists, queue, lyrics, and settings sections.
+- Now Playing artwork panel reads embedded artwork from the active audio file when available.
+- Inline synchronized lyrics preview with the current line highlighted.
+- Animated decorative visualizer bars that animate during playback (not a live audio-spectrum analyzer yet).
 - Playback via Media3 session service, background playback, media notification/session integration.
 - Play/pause, previous/next, seek bar, shuffle, repeat off/all/one.
 - Favorites, recently played history, play counts, locally stored playlists.
@@ -29,7 +30,7 @@ Some features from the requested aspirational list still require dedicated imple
 - Duplicate / broken-file analysis.
 - M3U/M3U8 import/export, backup/restore, and cloud backup.
 - Android Auto integration.
-- Animated album-art themes, true audio-spectrum visualizer, and full accessibility QA.
+- Live audio-reactive visualizer, animated album-art themes, and full accessibility QA.
 - Full editor timeline, undo/redo, and multi-line timestamp editing.
 
 ## Build
