@@ -16,9 +16,17 @@ A native Android local-music player built with Kotlin, Jetpack Compose, AndroidX
 - Remember the latest lyrics and selected track URI between launches.
 - Dark Material 3 interface.
 
-## Build the APK
+## Build the APK without Android Studio (GitHub Actions)
 
-A ZIP is a project archive, not an Android application package. A website that converts a ZIP's file extension cannot compile Android source code into an APK. Use Android Studio to build this project:
+This repository includes `.github/workflows/build-apk.yml`. It downloads Gradle 8.9 on the GitHub runner, configures Java 17 and the Android SDK, runs `assembleDebug`, and uploads the APK as an artifact.
+
+1. Upload the contents of this project folder to a GitHub repository (files such as `settings.gradle.kts` and the `app/` folder must be at repository root).
+2. Open the repository's **Actions** tab and select **Build Lyra Player APK**.
+3. Click **Run workflow** (or push/commit to `main` or `master` to trigger it).
+4. Open the completed run and download the `LyraPlayer-debug-apk` artifact. Extract the downloaded ZIP to find `app-debug.apk`.
+5. If the workflow fails, open the failed step and inspect its log; the project has not been verified by a successful cloud build yet.
+
+A ZIP is a project archive, not an Android application package. A website that converts a ZIP's file extension cannot compile Android source code into an APK. To build locally in Android Studio instead:
 
 1. Extract the ZIP.
 2. Open the `LyraPlayer` directory in Android Studio (the directory containing `settings.gradle.kts`).
