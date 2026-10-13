@@ -77,7 +77,7 @@ private data class AudioTrack(
 private data class LyraPlaylist(val name: String, val trackIds: List<String>)
 
 private enum class LyraTab(val label: String, val icon: String) {
-    HOME("Home", "⌂"), LIBRARY("Musik", "♫"), SEARCH("Cari", "⌕"),
+    HOME("Home", "⌂"), NOW_PLAYING("Putar", "▶"), LIBRARY("Musik", "♫"), SEARCH("Cari", "⌕"),
     PLAYLISTS("Playlist", "☷"), QUEUE("Antrean", "≡"), LYRICS("Lirik", "♪"), SETTINGS("Setelan", "⚙")
 }
 
