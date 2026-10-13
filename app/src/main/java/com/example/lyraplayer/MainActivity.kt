@@ -5,6 +5,8 @@ import android.content.ComponentName
 import android.content.Context
 import android.content.pm.PackageManager
 import android.database.Cursor
+import android.graphics.BitmapFactory
+import android.media.MediaMetadataRetriever
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
@@ -13,18 +15,26 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
+import androidx.compose.ui.graphics.Brush
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
 import androidx.documentfile.provider.DocumentFile
 import androidx.media3.common.MediaItem
@@ -39,6 +49,7 @@ import com.example.lyraplayer.playback.PlaybackService
 import com.example.lyraplayer.widget.LyricsWidgetProvider
 import com.google.common.util.concurrent.ListenableFuture
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -61,7 +72,7 @@ private data class LyraPlaylist(val name: String, val trackIds: List<String>)
 
 private enum class LyraTab(val label: String, val icon: String) {
     HOME("Home", "⌂"), LIBRARY("Musik", "♫"), SEARCH("Cari", "⌕"),
-    PLAYLISTS("Playlist", "☷"), QUEUE("Antrean", "≡"), LYRICS("Lirik", "♪"), SETTINGS("Setelan", "⚙")
+    PLAYLISTS("Playlist", "☷"), NOW_PLAYING("Diputar", "▶"), QUEUE("Antrean", "≡"), LYRICS("Lirik", "♪"), SETTINGS("Setelan", "⚙")
 }
 
 class MainActivity : ComponentActivity() {
@@ -105,6 +116,7 @@ private fun LyraApp() {
     var results by remember { mutableStateOf<List<LrcResult>>(emptyList()) }
     var lrcText by remember { mutableStateOf(prefs.getString("current_lrc", "").orEmpty()) }
     var currentLyric by remember { mutableStateOf("") }
+    var albumArt by remember { mutableStateOf<android.graphics.Bitmap?>(null) }
     var sleepMinutes by remember { mutableIntStateOf(0) }
     var showSleepDialog by remember { mutableStateOf(false) }
     var lastPlayed by remember { mutableStateOf(prefs.getString("recent_ids", "").orEmpty().split("|").filter { it.isNotBlank() }) }
@@ -256,6 +268,22 @@ private fun LyraApp() {
         else permissionLauncher.launch(permissionName())
     }
 
+    LaunchedEffect(currentUri) {
+        albumArt = withContext(Dispatchers.IO) {
+            val uri = currentUri
+            if (uri == null) null else runCatching {
+                val retriever = MediaMetadataRetriever()
+                try {
+                    retriever.setDataSource(context, uri)
+                    val bytes = retriever.embeddedPicture
+                    if (bytes != null) BitmapFactory.decodeByteArray(bytes, 0, bytes.size) else null
+                } finally {
+                    retriever.release()
+                }
+            }.getOrNull()
+        }
+    }
+
     LaunchedEffect(controller) {
         val c = controller ?: return@LaunchedEffect
         while (true) {
@@ -318,7 +346,7 @@ private fun LyraApp() {
                 Column {
                     if (currentUri != null || playing || currentTitle != "Belum ada lagu") {
                         Surface(color = MaterialTheme.colorScheme.surface, tonalElevation = 5.dp) {
-                            Column(Modifier.fillMaxWidth().clickable { tab = LyraTab.QUEUE }.padding(horizontal = 12.dp, vertical = 7.dp)) {
+                            Column(Modifier.fillMaxWidth().clickable { tab = LyraTab.NOW_PLAYING }.padding(horizontal = 12.dp, vertical = 7.dp)) {
                                 Row(verticalAlignment = Alignment.CenterVertically) {
                                     Column(Modifier.weight(1f)) {
                                         Text(currentTitle, maxLines = 1, overflow = TextOverflow.Ellipsis, fontWeight = FontWeight.SemiBold)
@@ -446,6 +474,36 @@ private fun LyraApp() {
                                 }
                             }
                         }
+                    }
+                    LyraTab.NOW_PLAYING -> {
+                        NowPlayingScreen(
+                            title = currentTitle,
+                            artist = currentArtist,
+                            album = currentAlbum,
+                            albumArt = albumArt,
+                            isPlaying = playing,
+                            position = position,
+                            duration = duration,
+                            shuffle = shuffle,
+                            repeatMode = repeatMode,
+                            lrcText = lrcText,
+                            onPlayPause = { if (playing) controller?.pause() else controller?.play() },
+                            onPrevious = { controller?.seekToPreviousMediaItem() },
+                            onNext = { controller?.seekToNextMediaItem() },
+                            onSeek = { controller?.seekTo(it) },
+                            onShuffle = { controller?.shuffleModeEnabled = !(controller?.shuffleModeEnabled ?: false) },
+                            onRepeat = {
+                                val next = when (controller?.repeatMode ?: Player.REPEAT_MODE_OFF) {
+                                    Player.REPEAT_MODE_OFF -> Player.REPEAT_MODE_ALL
+                                    Player.REPEAT_MODE_ALL -> Player.REPEAT_MODE_ONE
+                                    else -> Player.REPEAT_MODE_OFF
+                                }
+                                controller?.repeatMode = next
+                                repeatMode = next
+                            },
+                            onOpenLyrics = { tab = LyraTab.LYRICS },
+                            onOpenQueue = { tab = LyraTab.QUEUE }
+                        )
                     }
                     LyraTab.QUEUE -> {
                         Spacer(Modifier.height(10.dp))
@@ -645,6 +703,181 @@ private fun LyraApp() {
             dismissButton = { TextButton(onClick = { showSleepDialog = false }) { Text("Tutup") } }
         )
     }
+}
+
+@Composable
+private fun NowPlayingScreen(
+    title: String,
+    artist: String,
+    album: String,
+    albumArt: android.graphics.Bitmap?,
+    isPlaying: Boolean,
+    position: Long,
+    duration: Long,
+    shuffle: Boolean,
+    repeatMode: Int,
+    lrcText: String,
+    onPlayPause: () -> Unit,
+    onPrevious: () -> Unit,
+    onNext: () -> Unit,
+    onSeek: (Long) -> Unit,
+    onShuffle: () -> Unit,
+    onRepeat: () -> Unit,
+    onOpenLyrics: () -> Unit,
+    onOpenQueue: () -> Unit
+) {
+    val transition = androidx.compose.animation.core.rememberInfiniteTransition(label = "lyraVisualizer")
+    val barValues = (0 until 36).map { index ->
+        transition.animateFloat(
+            initialValue = 0.18f + ((index * 17) % 50) / 100f,
+            targetValue = 0.22f + ((index * 29 + 23) % 70) / 100f,
+            animationSpec = androidx.compose.animation.core.infiniteRepeatable(
+                animation = androidx.compose.animation.core.tween(
+                    durationMillis = 480 + (index % 6) * 120,
+                    easing = androidx.compose.animation.core.FastOutSlowInEasing
+                ),
+                repeatMode = androidx.compose.animation.core.RepeatMode.Reverse
+            ),
+            label = "bar$index"
+        )
+    }
+    val parsed = remember(lrcText) { LrcParser.parse(lrcText) }
+    val activeIndex = parsed.indexOfLast { it.timeMs <= position }.coerceAtLeast(0)
+    val lyricsState = rememberLazyListState()
+    LaunchedEffect(activeIndex, parsed.size) {
+        if (parsed.isNotEmpty()) runCatching { lyricsState.animateScrollToItem(activeIndex.coerceIn(parsed.indices)) }
+    }
+
+    Column(
+        Modifier.fillMaxSize().background(
+            Brush.verticalGradient(listOf(Color(0xFF28332C), Color(0xFF171A18), Color(0xFF101010)))
+        ).padding(horizontal = 18.dp),
+        horizontalAlignment = Alignment.CenterHorizontally
+    ) {
+        Spacer(Modifier.height(12.dp))
+        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+            Column(Modifier.weight(1f)) {
+                Text("SEDANG DIPUTAR", style = MaterialTheme.typography.labelSmall, color = Color(0xFFB8F36B), letterSpacing = 2.sp)
+                Text("Now Playing", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold, color = Color.White)
+            }
+            TextButton(onClick = onOpenQueue) { Text("Antrean  ≡", color = Color.White) }
+        }
+        Spacer(Modifier.height(18.dp))
+        Surface(
+            modifier = Modifier.fillMaxWidth().aspectRatio(1f).padding(horizontal = 14.dp),
+            shape = RoundedCornerShape(22.dp),
+            color = Color(0xFF2B302C),
+            shadowElevation = 18.dp
+        ) {
+            if (albumArt != null) {
+                androidx.compose.foundation.Image(
+                    bitmap = albumArt.asImageBitmap(),
+                    contentDescription = "Sampul album $title",
+                    modifier = Modifier.fillMaxSize(),
+                    contentScale = ContentScale.Crop
+                )
+            } else {
+                Box(
+                    Modifier.fillMaxSize().background(
+                        Brush.linearGradient(listOf(Color(0xFF506442), Color(0xFF222923), Color(0xFF111512)))
+                    ),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                        Text("♫", style = MaterialTheme.typography.displayLarge, color = Color(0xFFB8F36B), fontSize = 100.sp)
+                        Text("LYRA PLAYER", color = Color.White.copy(alpha = 0.75f), style = MaterialTheme.typography.labelLarge, letterSpacing = 3.sp)
+                    }
+                }
+            }
+        }
+        Spacer(Modifier.height(20.dp))
+        Column(Modifier.fillMaxWidth()) {
+            Text(title, style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Bold, color = Color.White, maxLines = 1, overflow = TextOverflow.Ellipsis)
+            Text(artist, style = MaterialTheme.typography.titleMedium, color = Color.White.copy(alpha = 0.72f), maxLines = 1, overflow = TextOverflow.Ellipsis)
+            if (album.isNotBlank()) Text(album, style = MaterialTheme.typography.bodySmall, color = Color.White.copy(alpha = 0.55f), maxLines = 1, overflow = TextOverflow.Ellipsis)
+        }
+        Spacer(Modifier.height(10.dp))
+        Slider(
+            value = if (duration > 0) position.coerceIn(0L, duration).toFloat() else 0f,
+            onValueChange = { if (duration > 0) onSeek(it.toLong()) },
+            valueRange = 0f..(duration.coerceAtLeast(1L)).toFloat(),
+            enabled = duration > 0
+        )
+        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+            Text(formatTime(position), color = Color.White.copy(alpha = 0.6f), style = MaterialTheme.typography.labelSmall)
+            Text(formatTime(duration), color = Color.White.copy(alpha = 0.6f), style = MaterialTheme.typography.labelSmall)
+        }
+        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceEvenly, verticalAlignment = Alignment.CenterVertically) {
+            TextButton(onClick = onShuffle) { Text(if (shuffle) "🔀" else "⇄", color = if (shuffle) Color(0xFFB8F36B) else Color.White, fontSize = 20.sp) }
+            TextButton(onClick = onPrevious) { Text("⏮", color = Color.White, fontSize = 24.sp) }
+            Button(
+                onClick = onPlayPause,
+                modifier = Modifier.size(68.dp),
+                shape = RoundedCornerShape(50),
+                contentPadding = PaddingValues(0.dp)
+            ) { Text(if (isPlaying) "Ⅱ" else "▶", fontSize = 28.sp) }
+            TextButton(onClick = onNext) { Text("⏭", color = Color.White, fontSize = 24.sp) }
+            TextButton(onClick = onRepeat) {
+                Text(when (repeatMode) {
+                    Player.REPEAT_MODE_ALL -> "🔁"
+                    Player.REPEAT_MODE_ONE -> "🔂"
+                    else -> "↻"
+                }, color = if (repeatMode != Player.REPEAT_MODE_OFF) Color(0xFFB8F36B) else Color.White, fontSize = 20.sp)
+            }
+        }
+        Spacer(Modifier.height(4.dp))
+        // Decorative animated visualizer; it is an animation, not a microphone/audio-spectrum analyzer.
+        Canvas(Modifier.fillMaxWidth().height(42.dp)) {
+            val gap = size.width / (barValues.size * 1.8f)
+            val barWidth = gap * 0.8f
+            barValues.forEachIndexed { index, animated ->
+                val h = size.height * (if (isPlaying) animated.value.coerceIn(0.12f, 0.95f) else 0.12f)
+                val x = index * gap * 1.8f
+                drawRoundRect(
+                    color = Color(0xFFB8F36B).copy(alpha = if (isPlaying) 0.9f else 0.28f),
+                    topLeft = androidx.compose.ui.geometry.Offset(x, (size.height - h) / 2f),
+                    size = androidx.compose.ui.geometry.Size(barWidth, h),
+                    cornerRadius = androidx.compose.ui.geometry.CornerRadius(barWidth, barWidth)
+                )
+            }
+        }
+        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+            Text("LIRIK", style = MaterialTheme.typography.labelLarge, color = Color(0xFFB8F36B), letterSpacing = 2.sp, modifier = Modifier.weight(1f))
+            TextButton(onClick = onOpenLyrics) { Text("Buka lirik lengkap  ↗", color = Color.White) }
+        }
+        if (parsed.isNotEmpty()) {
+            androidx.compose.foundation.lazy.LazyColumn(
+                state = lyricsState,
+                modifier = Modifier.fillMaxWidth().weight(1f),
+                horizontalAlignment = Alignment.CenterHorizontally,
+                contentPadding = PaddingValues(vertical = 4.dp)
+            ) {
+                items(parsed.size) { index ->
+                    Text(
+                        parsed[index].text.ifBlank { "♪" },
+                        modifier = Modifier.fillMaxWidth().clickable { onSeek(parsed[index].timeMs) }.padding(vertical = 7.dp, horizontal = 10.dp),
+                        style = if (index == activeIndex) MaterialTheme.typography.titleMedium else MaterialTheme.typography.bodyMedium,
+                        fontWeight = if (index == activeIndex) FontWeight.Bold else FontWeight.Normal,
+                        color = if (index == activeIndex) Color(0xFFB8F36B) else Color.White.copy(alpha = 0.55f),
+                        textAlign = androidx.compose.ui.text.style.TextAlign.Center
+                    )
+                }
+            }
+        } else {
+            Text(
+                "Lirik tersinkron akan tampil di sini. Buka tab Lirik untuk mencari melalui LRCLIB.",
+                color = Color.White.copy(alpha = 0.65f),
+                style = MaterialTheme.typography.bodySmall,
+                modifier = Modifier.padding(vertical = 8.dp)
+            )
+            Spacer(Modifier.weight(1f, fill = true))
+        }
+    }
+}
+
+private fun formatTime(ms: Long): String {
+    val seconds = (ms.coerceAtLeast(0L) / 1000L)
+    return "%d:%02d".format(seconds / 60, seconds % 60)
 }
 
 @Composable
