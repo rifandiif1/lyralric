@@ -52,6 +52,7 @@ class PlaybackService : MediaSessionService() {
             )
             .setHandleAudioBecomingNoisy(true)
             .build()
+        getSharedPreferences("lyra", MODE_PRIVATE).edit().putInt("audio_session_id", player.audioSessionId).apply()
         mediaSession = MediaSession.Builder(this, player).build()
         handler.post(lyricTicker)
     }
@@ -61,6 +62,7 @@ class PlaybackService : MediaSessionService() {
     override fun onDestroy() {
         handler.removeCallbacks(lyricTicker)
         mediaSession?.run { player.release(); release() }
+        getSharedPreferences("lyra", MODE_PRIVATE).edit().putInt("audio_session_id", 0).apply()
         mediaSession = null
         super.onDestroy()
     }

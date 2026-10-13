@@ -1,37 +1,47 @@
 # Lyra Player — Advanced local music player
 
-This project is an Android local-music-player foundation with an integrated LRC workspace.
+Lyra Player is an Android local music player with an LRC lyrics workspace, built with Kotlin, Jetpack Compose and AndroidX Media3. The project is prepared for building through GitHub Actions; it has **not** been compiled or device-tested in this environment.
 
-## Implemented in this revision
-- Local audio library via Android MediaStore.
-- Optional user-selected folder scan using Android's Storage Access Framework.
-- Search across title, artist, album, and folder.
-- Home overview, library, search, full Now Playing screen, playlists, queue, lyrics, and settings sections.
-- Now Playing artwork panel reads embedded artwork from the active audio file when available.
-- Inline synchronized lyrics preview with the current line highlighted.
-- Animated decorative visualizer bars that animate during playback (not a live audio-spectrum analyzer yet).
-- Playback via Media3 session service, background playback, media notification/session integration.
-- Play/pause, previous/next, seek bar, shuffle, repeat off/all/one.
-- Favorites, recently played history, play counts, locally stored playlists.
-- Queue inspection and queue item removal.
-- LRCLIB search, LRC import/export, timestamp insertion, and bulk timestamp offset.
-- Lyrics home-screen widget updates.
-- Dark/light theme toggle and sleep timer.
-- Audio focus and headset-unplug handling through Media3 audio attributes.
+## Features in this source revision
 
-## Important limitations
-This is an expanded development build, not a verified release. It has not been compiled on a real Android SDK in this environment. Run the GitHub Actions workflow and address any compiler errors before installing it.
+### Player and library
+- Netflix-inspired **Play Now** screen with album artwork when Android's MediaStore exposes it, title, artist, album, progress, elapsed/remaining time, favorite, previous/play/pause/next, shuffle and repeat.
+- Animated visualizer bars that animate in time with playback state and position. This is a visual animation, not an FFT/spectrum capture from the audio output.
+- Home hero/mini-player, local MediaStore audio scanning, optional user-selected SAF folder, search by title/artist/album/folder, recent history, play counts and favorites.
+- Local playlists, queue display, sleep timer, dark/light theme, and headset/audio-focus handling through Media3.
+- Background playback via `MediaSessionService` and system media notification/session controls.
 
-Some features from the requested aspirational list still require dedicated implementation and device testing, rather than just UI toggles:
-- Equalizer / bass boost / virtualizer and per-track loudness normalization.
-- Crossfade and gapless behavior validation.
-- Smart recommendations and advanced rule-based shuffle.
-- Full metadata editing and embedded artwork writing.
-- Duplicate / broken-file analysis.
-- M3U/M3U8 import/export, backup/restore, and cloud backup.
-- Android Auto integration.
-- Live audio-reactive visualizer, animated album-art themes, and full accessibility QA.
-- Full editor timeline, undo/redo, and multi-line timestamp editing.
+### Lyrics
+- LRCLIB lookup, LRC parsing and display, import/export LRC, timestamp insertion and timestamp offset adjustment.
+- Lyrics widget refreshes with the current timed lyric line.
 
-## Build
-Use the GitHub Actions workflow in `.github/workflows/build-apk.yml`. On a successful run, download the APK artifact from the workflow run page.
+### Audio and collection tools
+- Native Android Equalizer and BassBoost controls tied to the current playback audio session. Effect availability and supported bands depend on the phone, ROM and audio output; the panel gracefully reports when no session is active.
+- Smart-shuffle option that favors less-played tracks and penalizes recently played tracks when starting a shuffled selection.
+- JSON backup/restore for favorites, play history, play counts, playlist definitions, theme and smart-shuffle setting. Audio files themselves are not copied; imported track IDs work when they match the same local library.
+- M3U export for all scanned songs or the selected playlist. Android `content://` URIs are not portable across devices, so this is most useful as a same-device playlist reference unless paths are converted externally.
+- User-selected music folder permission is persisted where Android allows it.
+
+## Known limitations / honest notes
+
+- The visualizer is playback-synchronized animation, not true audio spectrum analysis. A true spectrum capture needs Android `Visualizer` permission/session testing and may be blocked by device policy.
+- Album artwork is loaded from Android's album-art content URI; some files, SAF-only sources and devices may not expose embedded art, in which case the designed fallback is shown.
+- Equalizer and bass boost effects are OEM-dependent and may not affect Bluetooth/DSP routes or all output paths.
+- Backup does not copy audio files or embed files into the archive. Playlist IDs may need rescan/relinking after moving the music library.
+- M3U import, crossfade controls, ReplayGain/loudness normalization, cloud sync, Android Auto, metadata writing, duplicate scanning and full accessibility QA are not claimed as implemented.
+- Run GitHub Actions and test on a real Android device before release. This source has not been verified by a successful local Android build in this environment.
+
+## Build APK on GitHub
+
+1. Create or open a GitHub repository and upload/push the **contents** of the `lyralric-main` folder to the repository root (so `settings.gradle.kts` and `.github/workflows/build-apk.yml` are at the root).
+2. Open **Actions** in GitHub and select **Build Lyra Player APK**.
+3. Click **Run workflow** (or push to `main`/`master`).
+4. Wait for the job to finish. Open the completed run and download the **LyraPlayer-debug-apk** artifact.
+5. Extract the ZIP artifact and install the APK on your Android device. Android may ask you to allow installation from the browser/file manager.
+
+The workflow builds a **debug APK**, which is suitable for personal testing. For Play Store distribution, configure a release signing key and a separate signed release workflow. Never commit a signing key or passwords to the repository.
+
+
+### Live Audio Spectrum (FFT)
+
+The Play Now visualizer uses Android `android.media.audiofx.Visualizer` attached to the Media3 player's audio session and renders 48 logarithmically spaced FFT bands. On first use, tap **Aktifkan analisis spektrum audio** to grant Android's `RECORD_AUDIO` permission. The capture is limited to the app's active playback session; some OEMs/audio routes may block capture, in which case the UI reports that the session is unsupported. The effect is released when playback pauses or the screen leaves the active composition.
