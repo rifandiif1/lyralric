@@ -1,51 +1,44 @@
 package com.example.lyraplayer.widget
 
+import android.app.PendingIntent
 import android.appwidget.AppWidgetManager
 import android.appwidget.AppWidgetProvider
 import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
-import android.app.PendingIntent
 import android.widget.RemoteViews
+import com.example.lyraplayer.MainActivity
 import com.example.lyraplayer.R
 
 class LyricsWidgetProvider : AppWidgetProvider() {
-    override fun onUpdate(context: Context, manager: AppWidgetManager, ids: IntArray) {
+    override fun onUpdate(context: Context, appWidgetManager: AppWidgetManager, appWidgetIds: IntArray) {
         val prefs = context.getSharedPreferences("lyra", Context.MODE_PRIVATE)
-        update(context, manager, ids, prefs.getString("current_title", "Lyra Player").orEmpty(), prefs.getString("current_lyric", "Pilih lagu untuk menampilkan lirik").orEmpty())
-    }
-
-    override fun onReceive(context: Context, intent: android.content.Intent) {
-        super.onReceive(context, intent)
-        if (intent.action == ACTION_UPDATE) {
-            updateAll(context, intent.getStringExtra("title").orEmpty(), intent.getStringExtra("lyric").orEmpty())
-        }
+        val title = prefs.getString("current_title", "Lyra Player").orEmpty()
+        val lrc = prefs.getString("current_lrc", "").orEmpty()
+        updateAll(context, title, if (lrc.isBlank()) "Ketuk untuk membuka Lyra Player" else "♪ Memutar musik...")
     }
 
     companion object {
-        const val ACTION_UPDATE = "com.example.lyraplayer.UPDATE_LYRICS_WIDGET"
         fun updateAll(context: Context, title: String, lyric: String) {
-            context.getSharedPreferences("lyra", Context.MODE_PRIVATE).edit()
-                .putString("current_title", title).putString("current_lyric", lyric).apply()
             val manager = AppWidgetManager.getInstance(context)
             val ids = manager.getAppWidgetIds(ComponentName(context, LyricsWidgetProvider::class.java))
-            update(context, manager, ids, title, lyric)
-        }
-        private fun update(context: Context, manager: AppWidgetManager, ids: IntArray, title: String, lyric: String) {
-            ids.forEach { id ->
-                val views = RemoteViews(context.packageName, R.layout.lyrics_widget)
-                views.setTextViewText(R.id.widget_title, title.ifBlank { "Lyra Player" })
-                views.setTextViewText(R.id.widget_lyric, lyric.ifBlank { "Lirik belum tersedia" })
-                val launchIntent = context.packageManager.getLaunchIntentForPackage(context.packageName)
-                if (launchIntent != null) {
-                    val pending = PendingIntent.getActivity(
-                        context, id, launchIntent,
-                        PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
-                    )
-                    views.setOnClickPendingIntent(R.id.widget_root, pending)
-                }
-                manager.updateAppWidget(id, views)
+            if (ids.isEmpty()) return
+
+            val launchIntent = Intent(context, MainActivity::class.java).apply {
+                flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP
             }
+            val pendingIntent = PendingIntent.getActivity(
+                context, 0, launchIntent,
+                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+            )
+
+            val views = RemoteViews(context.packageName, R.layout.lyrics_widget).apply {
+                setTextViewText(R.id.widget_title, title.ifBlank { "Lyra Player" })
+                setTextViewText(R.id.widget_lyric, lyric.ifBlank { "♪ Lirik belum tersedia" })
+                setOnClickPendingIntent(R.id.widget_title, pendingIntent)
+                setOnClickPendingIntent(R.id.widget_lyric, pendingIntent)
+            }
+            manager.updateAppWidget(ids, views)
         }
     }
 }
