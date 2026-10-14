@@ -14,6 +14,7 @@ import com.example.lyraplayer.widget.LyricsWidgetProvider
 
 class PlaybackService : MediaSessionService() {
     private var mediaSession: MediaSession? = null
+    private var exoPlayer: ExoPlayer? = null
     private val handler = Handler(Looper.getMainLooper())
     private var lastLyric = ""
     private var lastTitle = ""
@@ -21,15 +22,15 @@ class PlaybackService : MediaSessionService() {
     private val lyricTicker = object : Runnable {
         override fun run() {
             val session = mediaSession
-            if (session != null) {
+            val player = exoPlayer
+            if (session != null && player != null) {
                 val prefs = getSharedPreferences("lyra", MODE_PRIVATE)
-                val currentSessionId = session.player.audioSessionId
+                val currentSessionId = player.audioSessionId
                 if (currentSessionId > 0 && prefs.getInt("audio_session_id", 0) != currentSessionId) {
                     prefs.edit().putInt("audio_session_id", currentSessionId).apply()
                 }
                 val lrc = prefs.getString("current_lrc", "").orEmpty()
-                // Bersihkan tag enhanced <mm:ss.xx> untuk tampilan widget
-                val rawLyric = LrcParser.displayLine(lrc, session.player.currentPosition)
+                val rawLyric = LrcParser.displayLine(lrc, player.currentPosition)
                 val cleanLyric = rawLyric.replace(Regex("<\\d{1,2}:\\d{2}(?:[.:]\\d{1,3})?>"), "").trim()
                 val title = prefs.getString("current_title", "Lyra Player").orEmpty()
                 if (cleanLyric != lastLyric || title != lastTitle) {
@@ -60,6 +61,8 @@ class PlaybackService : MediaSessionService() {
             .setHandleAudioBecomingNoisy(true)
             .build()
 
+        exoPlayer = player
+
         if (player.audioSessionId > 0) {
             prefs.edit().putInt("audio_session_id", player.audioSessionId).apply()
         }
@@ -81,6 +84,7 @@ class PlaybackService : MediaSessionService() {
     override fun onDestroy() {
         handler.removeCallbacks(lyricTicker)
         mediaSession?.run { player.release(); release() }
+        exoPlayer = null
         getSharedPreferences("lyra", MODE_PRIVATE).edit().putInt("audio_session_id", 0).apply()
         mediaSession = null
         super.onDestroy()
