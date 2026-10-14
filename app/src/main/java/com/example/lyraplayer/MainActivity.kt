@@ -83,12 +83,17 @@ import com.example.lyraplayer.playback.PlaybackService
 import com.example.lyraplayer.widget.LyricsWidgetProvider
 import com.google.common.util.concurrent.ListenableFuture
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
+import java.net.HttpURLConnection
+import java.net.URL
+import java.net.URLEncoder
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -127,14 +132,7 @@ private data class KaraokeLine(
 )
 
 private enum class LyraTab(val label: String) { HOME("Home"), NOW_PLAYING("Putar"), LIBRARY("Musik"), LYRICS("Lirik"), SETTINGS("Setelan") }
-
-private enum class LibrarySubTab(val title: String) {
-    ALL("Semua"),
-    FOLDERS("Folder"),
-    FAVORITES("Favorit"),
-    PLAYLISTS("Playlist"),
-    QUEUE("Antrean")
-}
+private enum class LibrarySubTab(val title: String) { ALL("Semua"), FOLDERS("Folder"), FAVORITES("Favorit"), PLAYLISTS("Playlist"), QUEUE("Antrean") }
 
 private enum class SortOption(val label: String) {
     DATE_ADDED_DESC("Terbaru Ditambahkan"),
@@ -218,21 +216,205 @@ private fun cleanSearchQuery(rawTitle: String, rawArtist: String): Pair<String, 
     return Pair(t.ifBlank { rawTitle.trim() }, a)
 }
 
-private suspend fun smartLyricsSearch(rawTitle: String, rawArtist: String): List<LrcResult> = withContext(Dispatchers.IO) {
-    val (cleanT, cleanA) = cleanSearchQuery(rawTitle, rawArtist)
-    val merged = linkedMapOf<String, LrcResult>()
-    fun collect(list: List<LrcResult>) {
-        for (item in list) if (!item.syncedLyrics.isNullOrBlank() || !item.plainLyrics.isNullOrBlank()) {
-            val itemName = item.name.orEmpty().lowercase(Locale.ROOT)
-            val itemArtist = item.artist.orEmpty().lowercase(Locale.ROOT)
-            val k = "$itemName|$itemArtist|${!item.syncedLyrics.isNullOrBlank()}"
-            if (!merged.containsKey(k)) merged[k] = item
+// ============================================================================
+// LYRICSIFY.COM EXTRACTOR & ENHANCED LRC PRIORITY ENGINE
+// ============================================================================
+private object LyricsifyExtractor {
+    private const val BASE_URL = "https://www.lyricsify.com"
+    private val enhancedCheckRegex = Regex("<\\d{1,2}:\\d{2}(?:[.:]\\d{1,3})?>|\\[\\d{1,2}:\\d{2}(?:[.:]\\d{1,3})?\\].*?\\[\\d{1,2}:\\d{2}(?:[.:]\\d{1,3})?\\]")
+
+    fun hasEnhancedKaraokeTags(lrc: String?): Boolean {
+        if (lrc.isNullOrBlank()) return false
+        return enhancedCheckRegex.containsMatchIn(lrc)
+    }
+
+    private fun httpGet(urlStr: String): String {
+        val conn = (URL(urlStr).openConnection() as HttpURLConnection).apply {
+            requestMethod = "GET"
+            connectTimeout = 9000
+            readTimeout = 9000
+            instanceFollowRedirects = true
+            setRequestProperty("User-Agent", "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Mobile Safari/537.36")
+            setRequestProperty("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+            setRequestProperty("Accept-Language", "id-ID,id;q=0.9,en-US;q=0.8,en;q=0.7")
+        }
+        return try {
+            val stream = if (conn.responseCode in 200..299) conn.inputStream else conn.errorStream
+            stream?.bufferedReader()?.use { it.readText() }.orEmpty()
+        } finally {
+            conn.disconnect()
         }
     }
-    if (cleanT.isNotBlank() && cleanA.isNotBlank()) runCatching { LrclibClient.search(cleanT, cleanA) }.getOrNull()?.let { collect(it) }
-    if (merged.values.none { !it.syncedLyrics.isNullOrBlank() } && cleanT.isNotBlank()) runCatching { LrclibClient.search(cleanT, "") }.getOrNull()?.let { collect(it) }
-    if (merged.isEmpty() && rawTitle.isNotBlank() && !rawTitle.equals(cleanT, true)) runCatching { LrclibClient.search(rawTitle.trim(), "") }.getOrNull()?.let { collect(it) }
-    merged.values.sortedWith(compareByDescending<LrcResult> { it.syncedLyrics?.contains("<") == true }.thenByDescending { !it.syncedLyrics.isNullOrBlank() }.thenByDescending { it.name.orEmpty().equals(cleanT, true) })
+
+    private fun decodeHtmlEntities(input: String): String {
+        return input
+            .replace(Regex("(?i)<br\\s*/?>"), "\n")
+            .replace(Regex("(?i)</p>"), "\n")
+            .replace(Regex("<[^>]+>"), "")
+            .replace("&lt;", "<")
+            .replace("&gt;", ">")
+            .replace("&amp;", "&")
+            .replace("&quot;", "\"")
+            .replace("&#039;", "'")
+            .replace("&#39;", "'")
+            .replace("&apos;", "'")
+            .replace("&nbsp;", " ")
+            .replace("&#10;", "\n")
+            .replace("&#13;", "")
+    }
+
+    private fun extractLrcFromHtml(html: String): String? {
+        // 1. Cari blok div id="entry" atau div class="entry" khas Lyricsify
+        val blockPatterns = listOf(
+            Regex("(?is)<div[^>]*id=[\"']entry[\"'][^>]*>(.*?)</div>"),
+            Regex("(?is)<div[^>]*id=[\"']lyrics[_-]?body[\"'][^>]*>(.*?)</div>"),
+            Regex("(?is)<pre[^>]*>(.*?)</pre>"),
+            Regex("(?is)<textarea[^>]*>(.*?)</textarea>")
+        )
+        for (pat in blockPatterns) {
+            for (m in pat.findAll(html)) {
+                val decoded = decodeHtmlEntities(m.groupValues[1])
+                val lrcLines = decoded.lines().map { it.trim() }.filter { it.matches(Regex("^\\[\\d{1,2}:\\d{2}.*")) || it.matches(Regex("^\\[(?:ti|ar|al|by|offset):.*", RegexOption.IGNORE_CASE)) }
+                if (lrcLines.size >= 3) return lrcLines.joinToString("\n")
+            }
+        }
+        // 2. Fallback: scan seluruh halaman untuk baris yang memiliki timestamp [mm:ss.xx]
+        val fullDecoded = decodeHtmlEntities(html)
+        val allSyncedLines = fullDecoded.lines().map { it.trim() }.filter {
+            it.matches(Regex("^\\[\\d{1,2}:\\d{2}(?:[.:]\\d{1,3})?\\].*"))
+        }
+        if (allSyncedLines.size >= 4) return allSyncedLines.joinToString("\n")
+        return null
+    }
+
+    fun fetchFromDirectUrl(pageUrl: String, fallbackTitle: String, fallbackArtist: String): LrcResult? {
+        return runCatching {
+            val html = httpGet(pageUrl)
+            val lrc = extractLrcFromHtml(html) ?: return null
+            val pageTitle = Regex("(?is)<title>(.*?)</title>").find(html)?.groupValues?.getOrNull(1)
+                ?.let { decodeHtmlEntities(it) }
+                ?.replace(Regex("(?i)\\s*[-|]?\\s*lyricsify.*"), "")
+                ?.replace(Regex("(?i)^lirik\\s+lagu\\s+"), "")
+                ?.trim()
+                .orEmpty()
+            val isEnh = hasEnhancedKaraokeTags(lrc)
+            LrcResult(
+                name = pageTitle.ifBlank { fallbackTitle.ifBlank { "Lyricsify Track" } },
+                artist = fallbackArtist.ifBlank { "Lyricsify" },
+                album = if (isEnh) "Lyricsify • Enhanced LRC ★" else "Lyricsify.com",
+                syncedLyrics = lrc,
+                plainLyrics = EnhancedLrcEngine.stripEnhancedTags(lrc)
+            )
+        }.getOrNull()
+    }
+
+    fun search(title: String, artist: String): List<LrcResult> {
+        val query = "$artist $title".trim()
+        if (query.isBlank()) return emptyList()
+        return runCatching {
+            val encoded = URLEncoder.encode(query, "UTF-8")
+            val searchHtml = httpGet("$BASE_URL/search?q=$encoded")
+            val linkRegex = Regex("(?i)href=[\"'](/lyrics/[^\"'?#]+|/lrc/[^\"'?#]+)[\"'][^>]*>(.*?)</a>")
+            val candidates = linkedMapOf<String, String>()
+            for (m in linkRegex.findAll(searchHtml)) {
+                val path = m.groupValues[1]
+                val label = decodeHtmlEntities(m.groupValues[2]).trim()
+                if (!candidates.containsKey(path) && label.length > 2) {
+                    candidates[path] = label
+                }
+                if (candidates.size >= 4) break
+            }
+            val foundResults = mutableListOf<LrcResult>()
+            for ((path, label) in candidates) {
+                val fullUrl = if (path.startsWith("http")) path else "$BASE_URL$path"
+                val pageHtml = runCatching { httpGet(fullUrl) }.getOrDefault("")
+                val lrc = extractLrcFromHtml(pageHtml)
+                if (!lrc.isNullOrBlank()) {
+                    val cleanLabel = label.replace(Regex("(?i)^lirik\\s+lagu\\s+"), "").trim()
+                    val splitArtist = if (cleanLabel.contains(" - ")) cleanLabel.substringBefore(" - ").trim() else artist.ifBlank { "Lyricsify" }
+                    val splitTitle = if (cleanLabel.contains(" - ")) cleanLabel.substringAfter(" - ").trim() else cleanLabel.ifBlank { title }
+                    val isEnh = hasEnhancedKaraokeTags(lrc)
+                    foundResults.add(
+                        LrcResult(
+                            name = splitTitle,
+                            artist = splitArtist,
+                            album = if (isEnh) "Lyricsify • Enhanced LRC ★" else "Lyricsify.com",
+                            syncedLyrics = lrc,
+                            plainLyrics = EnhancedLrcEngine.stripEnhancedTags(lrc)
+                        )
+                    )
+                }
+            }
+            foundResults
+        }.getOrDefault(emptyList())
+    }
+}
+
+// Pencarian gabungan (Lyricsify.com + LRCLIB) dengan Prioritas #1 untuk Enhanced LRC Karaoke
+private suspend fun smartLyricsSearch(rawTitle: String, rawArtist: String): List<LrcResult> = withContext(Dispatchers.IO) {
+    val trimmedInput = rawTitle.trim()
+    // Jika pengguna memasukkan URL langsung dari Lyricsify.com
+    if (trimmedInput.startsWith("http://", true) || trimmedInput.startsWith("https://", true) || trimmedInput.contains("lyricsify.com/", true)) {
+        val url = if (trimmedInput.startsWith("http", true)) trimmedInput else "https://$trimmedInput"
+        val direct = LyricsifyExtractor.fetchFromDirectUrl(url, rawTitle, rawArtist)
+        if (direct != null) return@withContext listOf(direct)
+    }
+
+    val (cleanT, cleanA) = cleanSearchQuery(rawTitle, rawArtist)
+    val merged = linkedMapOf<String, LrcResult>()
+
+    fun collect(list: List<LrcResult>) {
+        for (item in list) {
+            if (!item.syncedLyrics.isNullOrBlank() || !item.plainLyrics.isNullOrBlank()) {
+                val itemName = item.name.orEmpty().lowercase(Locale.ROOT)
+                val itemArtist = item.artist.orEmpty().lowercase(Locale.ROOT)
+                val isEnh = LyricsifyExtractor.hasEnhancedKaraokeTags(item.syncedLyrics)
+                val fromLyricsify = item.album.orEmpty().contains("Lyricsify", true)
+                val k = "$itemName|$itemArtist|$isEnh|$fromLyricsify"
+                if (!merged.containsKey(k)) merged[k] = item
+            }
+        }
+    }
+
+    // Jalankan pencarian ke Lyricsify.com dan LRCLIB secara paralel
+    coroutineScope {
+        val lyricsifyDeferred = async { runCatching { LyricsifyExtractor.search(cleanT, cleanA) }.getOrDefault(emptyList()) }
+        val lrclibPrimaryDeferred = async {
+            if (cleanT.isNotBlank() && cleanA.isNotBlank()) runCatching { LrclibClient.search(cleanT, cleanA) }.getOrDefault(emptyList())
+            else emptyList()
+        }
+        collect(lyricsifyDeferred.await())
+        collect(lrclibPrimaryDeferred.await())
+    }
+
+    // Jika belum menemukan Enhanced LRC, perluas pencarian dengan judul saja
+    if (merged.values.none { LyricsifyExtractor.hasEnhancedKaraokeTags(it.syncedLyrics) } && cleanT.isNotBlank()) {
+        coroutineScope {
+            val lrcFallback = async { runCatching { LrclibClient.search(cleanT, "") }.getOrDefault(emptyList()) }
+            val lyfFallback = async {
+                if (cleanA.isNotBlank()) runCatching { LyricsifyExtractor.search(cleanT, "") }.getOrDefault(emptyList())
+                else emptyList()
+            }
+            collect(lyfFallback.await())
+            collect(lrcFallback.await())
+        }
+    }
+
+    if (merged.isEmpty() && rawTitle.isNotBlank() && !rawTitle.equals(cleanT, true)) {
+        runCatching { LrclibClient.search(rawTitle.trim(), "") }.getOrNull()?.let { collect(it) }
+    }
+
+    // Urutkan dengan Prioritas Mutlak:
+    // 1. Enhanced LRC (<mm:ss.xx> / Word-by-Word Karaoke)
+    // 2. Hasil dari Lyricsify.com / Kecocokan Judul
+    // 3. Synced LRC biasa ([mm:ss.xx])
+    // 4. Plain Lyrics
+    merged.values.sortedWith(
+        compareByDescending<LrcResult> { LyricsifyExtractor.hasEnhancedKaraokeTags(it.syncedLyrics) }
+            .thenByDescending { !it.syncedLyrics.isNullOrBlank() }
+            .thenByDescending { it.album.orEmpty().contains("Lyricsify", true) }
+            .thenByDescending { it.name.orEmpty().equals(cleanT, true) }
+    )
 }
 
 private fun JSONArray?.toStringList(): List<String> {
@@ -291,7 +473,11 @@ private object EnhancedLrcEngine {
         return m * 60_000L + s * 1_000L + f
     }
 
-    fun stripEnhancedTags(raw: String): String = raw.replace(Regex("<\\d{1,2}:\\d{2}(?:[.:]\\d{1,3})?>"), "").trim()
+    fun stripEnhancedTags(raw: String): String =
+        raw.replace(Regex("<\\d{1,2}:\\d{2}(?:[.:]\\d{1,3})?>"), "")
+            .replace(Regex("\\[\\d{1,2}:\\d{2}(?:[.:]\\d{1,3})?\\]"), "")
+            .trim()
+
     fun formatLineTag(ms: Long): String { val s = ms.coerceAtLeast(0L); return String.format(Locale.ROOT, "[%02d:%02d.%02d]", s / 60_000L, (s % 60_000L) / 1_000L, (s % 1_000L) / 10L) }
     fun formatWordTag(ms: Long): String { val s = ms.coerceAtLeast(0L); return String.format(Locale.ROOT, "<%02d:%02d.%02d>", s / 60_000L, (s % 60_000L) / 1_000L, (s % 1_000L) / 10L) }
 
@@ -324,17 +510,16 @@ private object EnhancedLrcEngine {
             }
         }
         if (rawEntries.isEmpty()) {
-            return lrcText.lines().map { it.trim() }.filter { it.isNotBlank() }.mapIndexed { i, txt ->
+            return lrcText.lines().map { it.trim() }.filter { it.isNotBlank() && !it.startsWith("[") }.mapIndexed { i, txt ->
                 val s = i * 4000L; val e = s + 3800L
                 val (mainTxt, transTxt) = splitDualTranslation(txt)
                 KaraokeLine(s, e, mainTxt, if (enableAutoWord) interpolateWords(mainTxt, s, e) else emptyList(), false, transTxt)
             }
         }
 
-        // Gabungkan baris yang memiliki timestamp sama sebagai Dual-Language (Baris Utama + Terjemahan)
         val groupedByTime = linkedMapOf<Long, MutableList<String>>()
         for ((ms, body) in rawEntries.sortedBy { it.first }) {
-            groupedByTime.getOrPut(ms) { mutableListOf() }.add(body)
+            if (body.isNotBlank()) groupedByTime.getOrPut(ms) { mutableListOf() }.add(body)
         }
         val mergedEntries = groupedByTime.entries.map { (ms, bodies) ->
             val primaryBody = bodies.first()
@@ -356,7 +541,12 @@ private object EnhancedLrcEngine {
                 for (i in angleMatches.indices) {
                     val m = angleMatches[i]; val wS = toMs(m.groupValues[1], m.groupValues[2], m.groupValues.getOrNull(3))
                     val nextW = if (i + 1 < angleMatches.size) toMs(angleMatches[i + 1].groupValues[1], angleMatches[i + 1].groupValues[2], angleMatches[i + 1].groupValues.getOrNull(3)) else lineEnd
-                    if (m.groupValues[4].isNotEmpty()) words.add(KaraokeWord(m.groupValues[4], wS, maxOf(wS + 60L, nextW)))
+                    val rawWordText = m.groupValues[4]
+                    if (rawWordText.isNotEmpty()) {
+                        val nextStartsWithSpace = angleMatches.getOrNull(i + 1)?.groupValues?.getOrNull(4)?.startsWith(" ") == true
+                        val normalizedWord = if (!rawWordText.endsWith(" ") && !nextStartsWithSpace && i < angleMatches.lastIndex && rawWordText.length > 1) "$rawWordText " else rawWordText
+                        words.add(KaraokeWord(normalizedWord, wS, maxOf(wS + 60L, nextW)))
+                    }
                 }
                 KaraokeLine(startMs, lineEnd, words.joinToString("") { it.text }.trim(), words, true, finalTrans)
             } else if (lineTsRegex.containsMatchIn(body)) {
@@ -364,7 +554,8 @@ private object EnhancedLrcEngine {
                 val words = matches.mapIndexedNotNull { i, m ->
                     val wS = toMs(m.groupValues[1], m.groupValues[2], m.groupValues.getOrNull(3))
                     val nextW = if (i + 1 < matches.size) toMs(matches[i + 1].groupValues[1], matches[i + 1].groupValues[2], matches[i + 1].groupValues.getOrNull(3)) else lineEnd
-                    if (m.groupValues[4].isNotEmpty()) KaraokeWord(m.groupValues[4], wS, maxOf(wS + 60L, nextW)) else null
+                    val rawWordText = m.groupValues[4]
+                    if (rawWordText.isNotEmpty()) KaraokeWord(rawWordText, wS, maxOf(wS + 60L, nextW)) else null
                 }
                 KaraokeLine(startMs, lineEnd, words.joinToString("") { it.text }.trim(), words, true, finalTrans)
             } else {
@@ -640,7 +831,6 @@ private fun KaraokeWordText(line: KaraokeLine, positionMs: Long, isCurrentLine: 
             }
             Text(annotated, fontSize = fontSizeSp.sp, textAlign = textAlign, lineHeight = (fontSizeSp + 7).sp)
         }
-        // Tampilan Dual-Language / Terjemahan Lirik Dua Baris
         if (line.translationText.isNotBlank()) {
             Spacer(Modifier.height(2.dp))
             Text(
@@ -662,10 +852,10 @@ private fun KaraokeMiniStage(lines: List<KaraokeLine>, positionMs: Long, hasEnha
         Column(Modifier.fillMaxWidth().clickable { if (lines.isEmpty()) onOpenSearchClick() else onExpandClick() }.padding(horizontal = 16.dp, vertical = 10.dp), horizontalAlignment = Alignment.CenterHorizontally) {
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
                 Text(when { hasEnhancedTag -> "KARAOKE ENHANCED LRC ★"; autoWordKaraoke -> "AUTO-WORD KARAOKE"; else -> "SYNCED LRC (PER BARIS)" }, style = MaterialTheme.typography.labelSmall, color = accentColor, fontWeight = FontWeight.Black)
-                Text(if (lines.isEmpty()) "Cari Lirik ⌕" else "Layar Penuh ↗", style = MaterialTheme.typography.labelSmall, color = accentColor)
+                Text(if (lines.isEmpty()) "Cari di Lyricsify / LRCLIB ⌕" else "Layar Penuh ↗", style = MaterialTheme.typography.labelSmall, color = accentColor)
             }
             Spacer(Modifier.height(4.dp))
-            if (currentLine == null) Text("Lirik belum tersedia — ketuk untuk mencari lirik online", style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant, textAlign = TextAlign.Center, modifier = Modifier.padding(vertical = 6.dp))
+            if (currentLine == null) Text("Lirik belum tersedia — ketuk untuk mencari di Lyricsify & LRCLIB", style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant, textAlign = TextAlign.Center, modifier = Modifier.padding(vertical = 6.dp))
             else {
                 KaraokeWordText(currentLine, positionMs, true, 17, accentColor, TextAlign.Center, Modifier.fillMaxWidth())
                 if (nextLine != null) { Spacer(Modifier.height(3.dp)); Text(nextLine.plainText.ifBlank { "•••" }, style = MaterialTheme.typography.bodySmall, color = Color.White.copy(alpha = 0.45f), maxLines = 1, overflow = TextOverflow.Ellipsis, textAlign = TextAlign.Center) }
@@ -685,8 +875,8 @@ private fun KaraokeFullStage(lines: List<KaraokeLine>, positionMs: Long, hasEnha
             Column(Modifier.fillMaxSize().padding(20.dp), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.Center) {
                 LyraBrandLogo(size = 64.dp, cornerRadius = 18.dp); Spacer(Modifier.height(12.dp))
                 Text("Lirik Belum Tersedia", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold, color = Color.White)
-                Spacer(Modifier.height(10.dp))
-                Button(onClick = onEditLyricsClick, shape = RoundedCornerShape(16.dp)) { Text("⌕ Cari Lirik Online Sekarang") }
+                Text("Mendukung pencarian otomatis Enhanced LRC dari Lyricsify.com & LRCLIB.", style = MaterialTheme.typography.bodySmall, color = Color.White.copy(alpha = 0.6f), textAlign = TextAlign.Center, modifier = Modifier.padding(top = 4.dp, bottom = 12.dp))
+                Button(onClick = onEditLyricsClick, shape = RoundedCornerShape(16.dp)) { Text("⌕ Cari di Lyricsify & LRCLIB") }
             }
         } else {
             LazyColumn(state = listState, contentPadding = PaddingValues(vertical = 85.dp), verticalArrangement = Arrangement.spacedBy(14.dp), modifier = Modifier.fillMaxSize()) {
@@ -697,7 +887,7 @@ private fun KaraokeFullStage(lines: List<KaraokeLine>, positionMs: Long, hasEnha
                     Column(Modifier.fillMaxWidth().graphicsLayer { scaleX = scale; scaleY = scale }.alpha(alphaVal).clip(RoundedCornerShape(18.dp)).background(if (isCurrent) Color.White.copy(alpha = 0.08f) else Color.Transparent).clickable { onSeekTo(line.startMs) }.padding(horizontal = 14.dp, vertical = 10.dp)) {
                         Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.SpaceBetween, modifier = Modifier.fillMaxWidth()) {
                             Text(formatTime(line.startMs), style = MaterialTheme.typography.labelSmall, color = if (isCurrent) accentColor else Color.White.copy(alpha = 0.35f))
-                            if (isCurrent) Text("● AKTIF", style = MaterialTheme.typography.labelSmall, fontSize = 9.sp, color = accentColor, fontWeight = FontWeight.Black)
+                            if (isCurrent) Text(if (line.isEnhanced) "★ ENHANCED KARAOKE" else "● AKTIF", style = MaterialTheme.typography.labelSmall, fontSize = 9.sp, color = accentColor, fontWeight = FontWeight.Black)
                         }
                         Spacer(Modifier.height(4.dp))
                         KaraokeWordText(line, positionMs, isCurrent, if (isCurrent) 21 else 16, accentColor, TextAlign.Start, Modifier.fillMaxWidth())
@@ -969,7 +1159,6 @@ private fun LyraApp() {
     var autoWordKaraoke by remember { mutableStateOf(prefs.getBoolean("auto_word_karaoke", true)) }
     var bluetoothLiveLyrics by remember { mutableStateOf(prefs.getBoolean("bt_live_lyrics", false)) }
 
-    // Karaoke Voice Recorder State
     var isRecordingKaraoke by remember { mutableStateOf(false) }
     var recordingSeconds by remember { mutableIntStateOf(0) }
     var activeRecorder by remember { mutableStateOf<MediaRecorder?>(null) }
@@ -1005,7 +1194,7 @@ private fun LyraApp() {
     var results by remember { mutableStateOf<List<LrcResult>>(emptyList()) }
     var lrcText by remember { mutableStateOf(prefs.getString("current_lrc", "").orEmpty()) }
     var currentLyric by remember { mutableStateOf("") }
-    var lyricsStatus by remember { mutableStateOf("Lirik otomatis siap") }
+    var lyricsStatus by remember { mutableStateOf("Lirik otomatis siap (Lyricsify + LRCLIB)") }
     var autoLyrics by remember { mutableStateOf(prefs.getBoolean("auto_lyrics", true)) }
     var sleepMinutes by remember { mutableIntStateOf(0) }
     var showSleepDialog by remember { mutableStateOf(false) }
@@ -1032,10 +1221,7 @@ private fun LyraApp() {
 
     fun toggleKaraokeRecording() {
         if (isRecordingKaraoke) {
-            runCatching {
-                activeRecorder?.stop()
-                activeRecorder?.release()
-            }
+            runCatching { activeRecorder?.stop(); activeRecorder?.release() }
             activeRecorder = null
             isRecordingKaraoke = false
             status = "Rekaman Karaoke tersimpan: $lastRecordedPath"
@@ -1062,9 +1248,7 @@ private fun LyraApp() {
                 recordingSeconds = 0
                 isRecordingKaraoke = true
                 status = "Merekam suara karaoke..."
-            }.onFailure {
-                status = "Gagal memulai perekam: ${it.message}"
-            }
+            }.onFailure { status = "Gagal memulai perekam: ${it.message}" }
         }
     }
 
@@ -1080,10 +1264,7 @@ private fun LyraApp() {
         if (playing) {
             if (smoothFadePause) {
                 scope.launch {
-                    for (step in 4 downTo 1) {
-                        runCatching { c.volume = step * 0.2f }
-                        delay(45)
-                    }
+                    for (step in 4 downTo 1) { runCatching { c.volume = step * 0.2f }; delay(45) }
                     c.pause()
                     runCatching { c.volume = 1.0f }
                 }
@@ -1112,11 +1293,16 @@ private fun LyraApp() {
         scope.launch {
             isSearchingLyrics = true
             val (cTitle, cArtist) = cleanSearchQuery(queryTitle, queryArtist)
-            lyricsStatus = "Mencari \"$cTitle\" ${if (cArtist.isNotBlank()) "oleh $cArtist" else ""}..."
+            lyricsStatus = "Mencari di Lyricsify.com & LRCLIB: \"$cTitle\"..."
             try {
                 val res = smartLyricsSearch(queryTitle, queryArtist)
                 results = res
-                lyricsStatus = if (res.isEmpty()) "Tidak ditemukan hasil untuk \"$cTitle\"." else "Ditemukan ${res.size} lirik."
+                val enhCount = res.count { LyricsifyExtractor.hasEnhancedKaraokeTags(it.syncedLyrics) }
+                lyricsStatus = when {
+                    res.isEmpty() -> "Tidak ditemukan hasil untuk \"$cTitle\". Coba tempel link URL Lyricsify."
+                    enhCount > 0 -> "Ditemukan ${res.size} lirik ($enhCount Enhanced Karaoke ★ diprioritaskan)."
+                    else -> "Ditemukan ${res.size} lirik dari Lyricsify & LRCLIB."
+                }
             } catch (e: Exception) { lyricsStatus = "Gagal mencari lirik: ${e.message ?: "periksa internet"}" }
             finally { isSearchingLyrics = false }
         }
@@ -1325,7 +1511,6 @@ private fun LyraApp() {
             if (now - lastWidgetSync > 450L) {
                 lastWidgetSync = now
                 LyricsWidgetProvider.updateAll(context, currentTitle, currentLyric)
-                // Kirim lirik live ke layar mobil / Smartwatch Bluetooth AVRCP jika diaktifkan
                 if (bluetoothLiveLyrics && currentLyric.isNotBlank() && currentLyric != lastBtLyricSent) {
                     lastBtLyricSent = currentLyric
                     val idx = c.currentMediaItemIndex
@@ -1345,6 +1530,7 @@ private fun LyraApp() {
         }
     }
 
+    // Auto-Lyrics: Prioritaskan Enhanced LRC dari File Lokal -> Cache -> Lyricsify.com & LRCLIB
     LaunchedEffect(currentTitle, currentArtist, currentUri, autoLyrics) {
         val rawT = currentTitle.trim(); val rawA = currentArtist.trim()
         if (rawT.isBlank() || rawT == "Belum ada lagu" || rawT == "Judul tidak diketahui") return@LaunchedEffect
@@ -1358,23 +1544,34 @@ private fun LyraApp() {
         if (localSidecar != null) {
             lrcText = localSidecar
             saveLrcToCache(localSidecar, rawT, rawA)
-            lyricsStatus = "Lirik dimuat otomatis dari file .LRC folder lokal"
+            lyricsStatus = if (LyricsifyExtractor.hasEnhancedKaraokeTags(localSidecar)) "Enhanced LRC ★ dimuat dari folder lokal" else "Lirik .LRC dimuat dari folder lokal"
             return@LaunchedEffect
         }
 
         val cache = runCatching { JSONObject(prefs.getString("lyrics_cache_json", "{}").orEmpty()) }.getOrElse { JSONObject() }
         val cached = cache.optString(key, "").takeIf { it.isNotBlank() && it != "null" }
-        if (cached != null) { lrcText = cached; prefs.edit().putString("current_lrc", cached).putString("current_lrc_key", key).apply(); lyricsStatus = "Lirik dimuat dari cache lokal"; return@LaunchedEffect }
+        if (cached != null) {
+            lrcText = cached
+            prefs.edit().putString("current_lrc", cached).putString("current_lrc_key", key).apply()
+            lyricsStatus = if (LyricsifyExtractor.hasEnhancedKaraokeTags(cached)) "Enhanced LRC ★ dimuat dari cache lokal" else "Lirik dimuat dari cache lokal"
+            return@LaunchedEffect
+        }
 
         if (!autoLyrics) { lyricsStatus = "Lirik otomatis nonaktif."; return@LaunchedEffect }
-        isSearchingLyrics = true; lyricsStatus = "Mencari lirik otomatis: $cleanT..."
+        isSearchingLyrics = true; lyricsStatus = "Mencari Enhanced LRC di Lyricsify & LRCLIB: $cleanT..."
         try {
             val candidates = smartLyricsSearch(rawT, rawA)
             val found = candidates.firstOrNull()
             if (found != null && lyricsCacheKey(currentTitle, currentArtist) == key) {
                 val lyrics = found.syncedLyrics ?: found.plainLyrics.orEmpty()
                 lrcText = lyrics; results = candidates; saveLrcToCache(lyrics, rawT, rawA)
-                lyricsStatus = if (!found.syncedLyrics.isNullOrBlank()) "Lirik tersinkron otomatis ditemukan" else "Lirik teks otomatis ditemukan"
+                val isEnh = LyricsifyExtractor.hasEnhancedKaraokeTags(lyrics)
+                val srcName = if (found.album.orEmpty().contains("Lyricsify", true)) "Lyricsify.com" else "LRCLIB"
+                lyricsStatus = when {
+                    isEnh -> "Enhanced LRC ★ ditemukan dari $srcName!"
+                    !found.syncedLyrics.isNullOrBlank() -> "Synced LRC ditemukan dari $srcName"
+                    else -> "Lirik teks ditemukan dari $srcName"
+                }
             } else if (lyricsCacheKey(currentTitle, currentArtist) == key) lyricsStatus = "Lirik belum ditemukan otomatis. Ketuk tab 'Cari Online'."
         } catch (e: Exception) { if (lyricsCacheKey(currentTitle, currentArtist) == key) lyricsStatus = "Pencarian gagal: ${e.message}" }
         finally { isSearchingLyrics = false }
@@ -1385,15 +1582,10 @@ private fun LyraApp() {
             delay(sleepMinutes * 60_000L)
             val c = controller
             if (c != null && smoothFadePause) {
-                for (step in 10 downTo 1) {
-                    runCatching { c.volume = step * 0.1f }
-                    delay(120)
-                }
+                for (step in 10 downTo 1) { runCatching { c.volume = step * 0.1f }; delay(120) }
                 c.pause()
                 runCatching { c.volume = 1.0f }
-            } else {
-                c?.pause()
-            }
+            } else c?.pause()
             sleepMinutes = 0; status = "Timer tidur selesai (musik dijeda dengan halus)."
         }
     }
@@ -1451,7 +1643,7 @@ private fun LyraApp() {
                     title = {
                         Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
                             LyraBrandLogo(size = 38.dp, cornerRadius = 11.dp)
-                            Column { Text("LYRA", fontWeight = FontWeight.Black); Text("KARAOKE · ENHANCED LRC · FFT", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.primary) }
+                            Column { Text("LYRA", fontWeight = FontWeight.Black); Text("LYRICSIFY · ENHANCED LRC · FFT", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.primary) }
                         }
                     },
                     actions = {
@@ -1512,7 +1704,7 @@ private fun LyraApp() {
                                     Text("PLAYING NOW", style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.primary, fontWeight = FontWeight.Black)
                                     Text(currentTitle, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold, maxLines = 1, overflow = TextOverflow.Ellipsis)
                                     Text(currentArtist.ifBlank { "Pilih lagu untuk mulai" }, style = MaterialTheme.typography.bodySmall, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                                    Text("Urutan: ${sortOption.label} · ≥${minDurationSec}s", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.primary, modifier = Modifier.padding(top = 4.dp))
+                                    Text("Lyricsify + LRCLIB · Urutan: ${sortOption.label}", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.primary, modifier = Modifier.padding(top = 4.dp))
                                 }
                                 FilledTonalIconButton(onClick = { if (currentUri != null || playing) togglePlayWithFade() else if (sortedAndFilteredSongs.isNotEmpty()) playTracks(sortedAndFilteredSongs, 0) }, modifier = Modifier.size(48.dp)) {
                                     LyraVectorIcon(if (playing) LyraIconType.PAUSE else LyraIconType.PLAY, tint = MaterialTheme.colorScheme.primary, size = 22.dp)
@@ -1551,7 +1743,6 @@ private fun LyraApp() {
                                 }
                             }
                             Row(verticalAlignment = Alignment.CenterVertically) {
-                                // Tombol Rekam Suara Karaoke
                                 Surface(
                                     shape = RoundedCornerShape(12.dp),
                                     color = if (isRecordingKaraoke) Color(0xFFD32F2F) else MaterialTheme.colorScheme.surfaceVariant,
@@ -1855,23 +2046,26 @@ private fun LyraApp() {
                             LyricsSubTab.SEARCH -> {
                                 ElevatedCard(shape = RoundedCornerShape(20.dp), modifier = Modifier.fillMaxWidth()) {
                                     Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                                        Text("Sumber: Lyricsify.com & LRCLIB (Prioritas Enhanced LRC ★)", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.primary, fontWeight = FontWeight.Bold)
                                         Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
-                                            OutlinedTextField(searchTrack, { searchTrack = it }, label = { Text("Judul Lagu") }, singleLine = true, shape = RoundedCornerShape(14.dp), modifier = Modifier.weight(1.2f))
-                                            OutlinedTextField(searchArtist, { searchArtist = it }, label = { Text("Artis (Opsional)") }, singleLine = true, shape = RoundedCornerShape(14.dp), modifier = Modifier.weight(1f))
+                                            OutlinedTextField(searchTrack, { searchTrack = it }, label = { Text("Judul Lagu / Link URL Lyricsify") }, singleLine = true, shape = RoundedCornerShape(14.dp), modifier = Modifier.weight(1.3f))
+                                            OutlinedTextField(searchArtist, { searchArtist = it }, label = { Text("Artis (Opsional)") }, singleLine = true, shape = RoundedCornerShape(14.dp), modifier = Modifier.weight(0.9f))
                                         }
                                         Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
                                             OutlinedButton(onClick = { val (cT, cA) = cleanSearchQuery(currentTitle, currentArtist); searchTrack = cT; searchArtist = cA; triggerManualLyricsSearch(cT, cA) }, shape = RoundedCornerShape(14.dp), modifier = Modifier.weight(1f)) { Text("↻ Lagu Saat Ini") }
-                                            Button(onClick = { triggerManualLyricsSearch(searchTrack, searchArtist) }, enabled = searchTrack.isNotBlank() && !isSearchingLyrics, shape = RoundedCornerShape(14.dp), modifier = Modifier.weight(1.3f)) { Text(if (isSearchingLyrics) "Mencari..." else "⌕ Cari Lirik") }
+                                            Button(onClick = { triggerManualLyricsSearch(searchTrack, searchArtist) }, enabled = searchTrack.isNotBlank() && !isSearchingLyrics, shape = RoundedCornerShape(14.dp), modifier = Modifier.weight(1.3f)) { Text(if (isSearchingLyrics) "Mencari..." else "⌕ Cari Lyricsify & LRCLIB") }
                                         }
                                     }
                                 }
                                 if (isSearchingLyrics) LinearProgressIndicator(modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp), color = MaterialTheme.colorScheme.primary) else Spacer(Modifier.height(8.dp))
                                 if (results.isEmpty() && !isSearchingLyrics) {
-                                    Box(Modifier.fillMaxWidth().weight(1f), contentAlignment = Alignment.Center) { EmptyState("Cari Lirik Lagu", "Masukkan judul lagu di atas lalu ketuk 'Cari Lirik'.") }
+                                    Box(Modifier.fillMaxWidth().weight(1f), contentAlignment = Alignment.Center) { EmptyState("Cari Lirik Karaoke", "Ketik judul lagu atau tempel langsung URL https://www.lyricsify.com/lyrics/... di atas.") }
                                 } else {
                                     LazyColumn(modifier = Modifier.fillMaxWidth().weight(1f), verticalArrangement = Arrangement.spacedBy(8.dp), contentPadding = PaddingValues(bottom = 14.dp)) {
                                         items(results) { res ->
-                                            val isSynced = !res.syncedLyrics.isNullOrBlank(); val isEnhanced = res.syncedLyrics?.contains("<") == true
+                                            val isSynced = !res.syncedLyrics.isNullOrBlank()
+                                            val isEnhanced = LyricsifyExtractor.hasEnhancedKaraokeTags(res.syncedLyrics)
+                                            val isFromLyricsify = res.album.orEmpty().contains("Lyricsify", true)
                                             val previewLines = (res.syncedLyrics ?: res.plainLyrics.orEmpty()).lines().map { EnhancedLrcEngine.stripEnhancedTags(it.substringAfterLast("]")).trim() }.filter { it.isNotBlank() }.take(2).joinToString(" / ")
                                             val nameStr = res.name.orEmpty(); val artistStr = res.artist.orEmpty(); val albumStr = res.album.orEmpty()
                                             ElevatedCard(onClick = { val chosen = res.syncedLyrics ?: res.plainLyrics.orEmpty(); lrcText = chosen; saveLrcToCache(chosen); lyricsStatus = "Lirik \"$nameStr\" disimpan"; lyricsSubTab = LyricsSubTab.PREVIEW }, shape = RoundedCornerShape(18.dp), colors = CardDefaults.elevatedCardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant)) {
@@ -1879,7 +2073,14 @@ private fun LyraApp() {
                                                     Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.SpaceBetween, modifier = Modifier.fillMaxWidth()) {
                                                         Text(nameStr, fontWeight = FontWeight.ExtraBold, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f))
                                                         Surface(shape = RoundedCornerShape(10.dp), color = when { isEnhanced -> dynamicAccent; isSynced -> Color(0xFF3A5A20); else -> Color(0xFF3A3A3A) }) {
-                                                            Text(when { isEnhanced -> "KARAOKE LRC ★"; isSynced -> "SYNCED LRC"; else -> "TEKS BIASA" }, style = MaterialTheme.typography.labelSmall, fontWeight = FontWeight.Bold, color = if (isEnhanced) Color(0xFF101010) else Color.White, modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp))
+                                                            val badgeText = when {
+                                                                isEnhanced && isFromLyricsify -> "LYRICSIFY ★ ENHANCED"
+                                                                isEnhanced -> "ENHANCED KARAOKE ★"
+                                                                isFromLyricsify && isSynced -> "LYRICSIFY SYNC"
+                                                                isSynced -> "LRCLIB SYNC"
+                                                                else -> "TEKS BIASA"
+                                                            }
+                                                            Text(badgeText, style = MaterialTheme.typography.labelSmall, fontWeight = FontWeight.Bold, color = if (isEnhanced) Color(0xFF101010) else Color.White, modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp))
                                                         }
                                                     }
                                                     Text("$artistStr${if (albumStr.isNotBlank()) " · $albumStr" else ""}", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.primary, maxLines = 1, overflow = TextOverflow.Ellipsis)
@@ -1923,7 +2124,7 @@ private fun LyraApp() {
                                 SettingRow("Mode Piringan Hitam (Vinyl)", "Tampilkan animasi piringan hitam berputar & tonearm di layar putar", vinylMode) { vinylMode = it; prefs.edit().putBoolean("vinyl_mode", it).apply() }
                                 SettingRow("Smooth Fade-Out", "Turunkan volume secara halus saat jeda & timer tidur", smoothFadePause) { smoothFadePause = it; prefs.edit().putBoolean("smooth_fade", it).apply() }
                                 SettingRow("Bluetooth Car / Watch Live Lyrics", "Kirim baris lirik aktif ke layar mobil atau smartwatch via metadata AVRCP", bluetoothLiveLyrics) { bluetoothLiveLyrics = it; prefs.edit().putBoolean("bt_live_lyrics", it).apply() }
-                                SettingRow("Lirik otomatis", "Cari lirik otomatis dari folder lokal, cache, atau internet", autoLyrics) { autoLyrics = it; prefs.edit().putBoolean("auto_lyrics", it).apply() }
+                                SettingRow("Lirik otomatis (Lyricsify + LRCLIB)", "Cari Enhanced LRC otomatis dari folder lokal, cache, Lyricsify.com, & LRCLIB", autoLyrics) { autoLyrics = it; prefs.edit().putBoolean("auto_lyrics", it).apply() }
                                 SettingRow("Auto-Word Karaoke (Estimasi Kata)", "Sorot kata demi kata otomatis untuk LRC biasa yang belum memiliki tag <mm:ss.xx>", autoWordKaraoke) { autoWordKaraoke = it; prefs.edit().putBoolean("auto_word_karaoke", it).apply() }
                             }
                             item {
