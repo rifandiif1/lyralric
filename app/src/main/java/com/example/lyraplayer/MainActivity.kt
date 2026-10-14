@@ -126,14 +126,16 @@ private suspend fun smartLyricsSearch(rawTitle: String, rawArtist: String): List
     val merged = linkedMapOf<String, LrcResult>()
     fun collect(list: List<LrcResult>) {
         for (item in list) if (!item.syncedLyrics.isNullOrBlank() || !item.plainLyrics.isNullOrBlank()) {
-            val k = "${item.name.lowercase(Locale.ROOT)}|${item.artist.lowercase(Locale.ROOT)}|${!item.syncedLyrics.isNullOrBlank()}"
+            val itemName = item.name.orEmpty().lowercase(Locale.ROOT)
+            val itemArtist = item.artist.orEmpty().lowercase(Locale.ROOT)
+            val k = "$itemName|$itemArtist|${!item.syncedLyrics.isNullOrBlank()}"
             if (!merged.containsKey(k)) merged[k] = item
         }
     }
     if (cleanT.isNotBlank() && cleanA.isNotBlank()) runCatching { LrclibClient.search(cleanT, cleanA) }.getOrNull()?.let { collect(it) }
     if (merged.values.none { !it.syncedLyrics.isNullOrBlank() } && cleanT.isNotBlank()) runCatching { LrclibClient.search(cleanT, "") }.getOrNull()?.let { collect(it) }
     if (merged.isEmpty() && rawTitle.isNotBlank() && !rawTitle.equals(cleanT, true)) runCatching { LrclibClient.search(rawTitle.trim(), "") }.getOrNull()?.let { collect(it) }
-    merged.values.sortedWith(compareByDescending<LrcResult> { it.syncedLyrics?.contains("<") == true }.thenByDescending { !it.syncedLyrics.isNullOrBlank() }.thenByDescending { it.name.equals(cleanT, true) })
+    merged.values.sortedWith(compareByDescending<LrcResult> { it.syncedLyrics?.contains("<") == true }.thenByDescending { !it.syncedLyrics.isNullOrBlank() }.thenByDescending { it.name.orEmpty().equals(cleanT, true) })
 }
 
 private fun JSONArray?.toStringList(): List<String> {
@@ -1211,15 +1213,18 @@ private fun LyraApp() {
                                         items(results) { res ->
                                             val isSynced = !res.syncedLyrics.isNullOrBlank(); val isEnhanced = res.syncedLyrics?.contains("<") == true
                                             val previewLines = (res.syncedLyrics ?: res.plainLyrics.orEmpty()).lines().map { EnhancedLrcEngine.stripEnhancedTags(it.substringAfterLast("]")).trim() }.filter { it.isNotBlank() }.take(2).joinToString(" / ")
-                                            ElevatedCard(onClick = { val chosen = res.syncedLyrics ?: res.plainLyrics.orEmpty(); lrcText = chosen; saveLrcToCache(chosen); lyricsStatus = "Lirik \"${res.name}\" disimpan"; lyricsSubTab = LyricsSubTab.PREVIEW }, shape = RoundedCornerShape(18.dp), colors = CardDefaults.elevatedCardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant)) {
+                                            val nameStr = res.name.orEmpty()
+                                            val artistStr = res.artist.orEmpty()
+                                            val albumStr = res.album.orEmpty()
+                                            ElevatedCard(onClick = { val chosen = res.syncedLyrics ?: res.plainLyrics.orEmpty(); lrcText = chosen; saveLrcToCache(chosen); lyricsStatus = "Lirik \"$nameStr\" disimpan"; lyricsSubTab = LyricsSubTab.PREVIEW }, shape = RoundedCornerShape(18.dp), colors = CardDefaults.elevatedCardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant)) {
                                                 Column(Modifier.fillMaxWidth().padding(14.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
                                                     Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.SpaceBetween, modifier = Modifier.fillMaxWidth()) {
-                                                        Text(res.name, fontWeight = FontWeight.ExtraBold, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f))
+                                                        Text(nameStr, fontWeight = FontWeight.ExtraBold, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f))
                                                         Surface(shape = RoundedCornerShape(10.dp), color = when { isEnhanced -> Color(0xFFB8F36B); isSynced -> Color(0xFF3A5A20); else -> Color(0xFF3A3A3A) }) {
                                                             Text(when { isEnhanced -> "KARAOKE LRC ★"; isSynced -> "SYNCED LRC"; else -> "TEKS BIASA" }, style = MaterialTheme.typography.labelSmall, fontWeight = FontWeight.Bold, color = if (isEnhanced) Color(0xFF101010) else Color.White, modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp))
                                                         }
                                                     }
-                                                    Text("${res.artist}${if (res.album.isNotBlank()) " · ${res.album}" else ""}", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.primary, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                                                    Text("$artistStr${if (albumStr.isNotBlank()) " · $albumStr" else ""}", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.primary, maxLines = 1, overflow = TextOverflow.Ellipsis)
                                                     if (previewLines.isNotBlank()) Text("\"$previewLines\"", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 2, overflow = TextOverflow.Ellipsis)
                                                 }
                                             }
