@@ -1,22 +1,30 @@
 package com.example.lyraplayer
 
 import android.Manifest
+import android.app.Activity
 import android.content.ComponentName
 import android.content.ContentUris
 import android.content.ContentValues
 import android.content.Context
+import android.content.Intent
 import android.content.SharedPreferences
 import android.content.pm.PackageManager
 import android.database.Cursor
+import android.media.MediaRecorder
 import android.media.audiofx.BassBoost
 import android.media.audiofx.Equalizer
+import android.media.audiofx.LoudnessEnhancer
+import android.media.audiofx.PresetReverb
+import android.media.audiofx.Virtualizer
 import android.media.audiofx.Visualizer
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.os.Environment
 import android.os.Handler
 import android.os.Looper
 import android.provider.MediaStore
+import android.view.WindowManager
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
@@ -50,6 +58,7 @@ import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.buildAnnotatedString
+import androidx.compose.ui.text.font.FontStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
@@ -79,6 +88,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
+import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -106,10 +116,25 @@ private data class AudioTrack(
 private data class MetadataOverride(val title: String, val artist: String, val album: String, val artworkUri: String = "")
 private data class LyraPlaylist(val name: String, val trackIds: List<String>)
 private data class KaraokeWord(val text: String, val startMs: Long, val endMs: Long)
-private data class KaraokeLine(val startMs: Long, val endMs: Long, val plainText: String, val words: List<KaraokeWord>, val isEnhanced: Boolean)
+
+private data class KaraokeLine(
+    val startMs: Long,
+    val endMs: Long,
+    val plainText: String,
+    val words: List<KaraokeWord>,
+    val isEnhanced: Boolean,
+    val translationText: String = ""
+)
 
 private enum class LyraTab(val label: String) { HOME("Home"), NOW_PLAYING("Putar"), LIBRARY("Musik"), LYRICS("Lirik"), SETTINGS("Setelan") }
-private enum class LibrarySubTab(val title: String) { ALL("Semua Lagu"), FAVORITES("Favorit"), PLAYLISTS("Playlist"), QUEUE("Antrean") }
+
+private enum class LibrarySubTab(val title: String) {
+    ALL("Semua"),
+    FOLDERS("Folder"),
+    FAVORITES("Favorit"),
+    PLAYLISTS("Playlist"),
+    QUEUE("Antrean")
+}
 
 private enum class SortOption(val label: String) {
     DATE_ADDED_DESC("Terbaru Ditambahkan"),
@@ -129,8 +154,29 @@ private enum class VisualizerStyle(val label: String) {
     PULSE_LINE("Pulse Line")
 }
 
+private enum class ThemeAccent(val label: String, val primaryHex: Long, val darkHex: Long) {
+    DYNAMIC("Dynamic Auto", 0xFFB8F36B, 0xFF283A18),
+    LYRA_NEON("Lyra Neon", 0xFFB8F36B, 0xFF283A18),
+    CYBER_CYAN("Cyber Cyan", 0xFF5CE1E6, 0xFF103238),
+    SUNSET_ROSE("Sunset Rose", 0xFFFF7597, 0xFF3B1622),
+    ROYAL_GOLD("Royal Gold", 0xFFFFD166, 0xFF3A2D10),
+    ELECTRIC_VIOLET("Electric Violet", 0xFFB388FF, 0xFF26183D)
+}
+
 private enum class LyricsSubTab(val title: String) { PREVIEW("♪ Karaoke"), SEARCH("⌕ Cari Online"), EDITOR("✎ Studio LRC") }
 private enum class LyraIconType { HOME, PLAY, PAUSE, NEXT, PREV, SHUFFLE, REPEAT_OFF, REPEAT_ALL, REPEAT_ONE, HEART_FILLED, HEART_OUTLINE, EDIT, PLUS, QUEUE, MUSIC, LYRICS, SETTINGS, SEARCH }
+
+private fun resolveThemeColors(preset: ThemeAccent, songTitle: String): Pair<Color, Color> {
+    if (preset != ThemeAccent.DYNAMIC) return Pair(Color(preset.primaryHex), Color(preset.darkHex))
+    val palettes = listOf(
+        Pair(Color(0xFFB8F36B), Color(0xFF283A18)),
+        Pair(Color(0xFF5CE1E6), Color(0xFF103238)),
+        Pair(Color(0xFFFF7597), Color(0xFF3B1622)),
+        Pair(Color(0xFFFFD166), Color(0xFF3A2D10)),
+        Pair(Color(0xFFB388FF), Color(0xFF26183D))
+    )
+    return palettes[abs(songTitle.hashCode()) % palettes.size]
+}
 
 private fun lyricsCacheKey(title: String, artist: String): String =
     (title.trim().substringBeforeLast('.', title.trim()) + "|" + artist.trim()).lowercase(Locale.ROOT).replace(Regex("\\s+"), " ").trim()
@@ -142,9 +188,18 @@ private fun formatTime(ms: Long): String {
 
 private fun formatAddedDate(sec: Long): String {
     if (sec <= 0L) return ""
+    return runCatching { SimpleDateFormat("dd MMM yy", Locale.getDefault()).format(Date(sec * 1000L)) }.getOrDefault("")
+}
+
+private fun tryReadLocalSidecarLrc(filePath: String): String? {
+    if (filePath.isBlank()) return null
     return runCatching {
-        SimpleDateFormat("dd MMM yy", Locale.getDefault()).format(Date(sec * 1000L))
-    }.getOrDefault("")
+        val audioFile = File(filePath)
+        val parent = audioFile.parentFile ?: return null
+        val base = audioFile.nameWithoutExtension
+        val candidates = listOf(File(parent, "$base.lrc"), File(parent, "$base.LRC"))
+        candidates.firstOrNull { it.exists() && it.canRead() }?.readText()?.takeIf { it.isNotBlank() }
+    }.getOrNull()
 }
 
 private fun cleanSearchQuery(rawTitle: String, rawArtist: String): Pair<String, String> {
@@ -218,14 +273,12 @@ private fun loadMetadataOverrides(raw: String): Map<String, MetadataOverride> = 
 private fun saveMetadataOverrides(prefs: SharedPreferences, map: Map<String, MetadataOverride>) {
     val root = JSONObject()
     for ((k, v) in map.entries) {
-        if (k.isNotBlank()) {
-            root.put(k, JSONObject().put("title", v.title).put("artist", v.artist).put("album", v.album).put("artworkUri", v.artworkUri))
-        }
+        if (k.isNotBlank()) root.put(k, JSONObject().put("title", v.title).put("artist", v.artist).put("album", v.album).put("artworkUri", v.artworkUri))
     }
     prefs.edit().putString("metadata_overrides_json", root.toString()).commit()
 }
 
-// === 2. ENHANCED LRC KARAOKE ENGINE ===
+// === 2. ENHANCED LRC KARAOKE & DUAL-LANGUAGE ENGINE ===
 private object EnhancedLrcEngine {
     private val lineTsRegex = Regex("\\[(\\d{1,2}):(\\d{2})(?:[.:](\\d{1,3}))?\\]")
     private val wordTsRegex = Regex("<(\\d{1,2}):(\\d{2})(?:[.:](\\d{1,3}))?>([^<]*)")
@@ -247,6 +300,18 @@ private object EnhancedLrcEngine {
         String.format(Locale.ROOT, "%s%02d:%02d.%02d%s", m.groupValues[1], n / 60_000L, (n % 60_000L) / 1_000L, (n % 1_000L) / 10L, m.groupValues[5])
     }
 
+    private fun splitDualTranslation(rawBody: String): Pair<String, String> {
+        if (rawBody.contains(" // ")) {
+            val p = rawBody.split(" // ", limit = 2)
+            return Pair(p[0].trim(), stripEnhancedTags(p[1]))
+        }
+        if (rawBody.contains(" | ")) {
+            val p = rawBody.split(" | ", limit = 2)
+            return Pair(p[0].trim(), stripEnhancedTags(p[1]))
+        }
+        return Pair(rawBody, "")
+    }
+
     fun parse(lrcText: String, enableAutoWord: Boolean): List<KaraokeLine> {
         if (lrcText.isBlank()) return emptyList()
         val rawEntries = mutableListOf<Pair<Long, String>>()
@@ -261,13 +326,27 @@ private object EnhancedLrcEngine {
         if (rawEntries.isEmpty()) {
             return lrcText.lines().map { it.trim() }.filter { it.isNotBlank() }.mapIndexed { i, txt ->
                 val s = i * 4000L; val e = s + 3800L
-                KaraokeLine(s, e, txt, if (enableAutoWord) interpolateWords(txt, s, e) else emptyList(), false)
+                val (mainTxt, transTxt) = splitDualTranslation(txt)
+                KaraokeLine(s, e, mainTxt, if (enableAutoWord) interpolateWords(mainTxt, s, e) else emptyList(), false, transTxt)
             }
         }
-        val sorted = rawEntries.sortedBy { it.first }
-        return sorted.mapIndexed { idx, entry ->
-            val startMs = entry.first; val body = entry.second
-            val lineEnd = maxOf(startMs + 600L, sorted.getOrNull(idx + 1)?.first ?: (startMs + 5000L))
+
+        // Gabungkan baris yang memiliki timestamp sama sebagai Dual-Language (Baris Utama + Terjemahan)
+        val groupedByTime = linkedMapOf<Long, MutableList<String>>()
+        for ((ms, body) in rawEntries.sortedBy { it.first }) {
+            groupedByTime.getOrPut(ms) { mutableListOf() }.add(body)
+        }
+        val mergedEntries = groupedByTime.entries.map { (ms, bodies) ->
+            val primaryBody = bodies.first()
+            val extraTrans = if (bodies.size > 1) stripEnhancedTags(bodies.drop(1).joinToString(" · ")) else ""
+            Triple(ms, primaryBody, extraTrans)
+        }
+
+        return mergedEntries.mapIndexed { idx, triple ->
+            val startMs = triple.first
+            val (body, inlineTrans) = splitDualTranslation(triple.second)
+            val finalTrans = if (triple.third.isNotBlank()) triple.third else inlineTrans
+            val lineEnd = maxOf(startMs + 600L, mergedEntries.getOrNull(idx + 1)?.first ?: (startMs + 5000L))
             val angleMatches = wordTsRegex.findAll(body).toList()
             if (angleMatches.isNotEmpty()) {
                 val words = mutableListOf<KaraokeWord>()
@@ -279,7 +358,7 @@ private object EnhancedLrcEngine {
                     val nextW = if (i + 1 < angleMatches.size) toMs(angleMatches[i + 1].groupValues[1], angleMatches[i + 1].groupValues[2], angleMatches[i + 1].groupValues.getOrNull(3)) else lineEnd
                     if (m.groupValues[4].isNotEmpty()) words.add(KaraokeWord(m.groupValues[4], wS, maxOf(wS + 60L, nextW)))
                 }
-                KaraokeLine(startMs, lineEnd, words.joinToString("") { it.text }.trim(), words, true)
+                KaraokeLine(startMs, lineEnd, words.joinToString("") { it.text }.trim(), words, true, finalTrans)
             } else if (lineTsRegex.containsMatchIn(body)) {
                 val matches = inlineBrRegex.findAll("${formatLineTag(startMs)}$body").toList()
                 val words = matches.mapIndexedNotNull { i, m ->
@@ -287,10 +366,10 @@ private object EnhancedLrcEngine {
                     val nextW = if (i + 1 < matches.size) toMs(matches[i + 1].groupValues[1], matches[i + 1].groupValues[2], matches[i + 1].groupValues.getOrNull(3)) else lineEnd
                     if (m.groupValues[4].isNotEmpty()) KaraokeWord(m.groupValues[4], wS, maxOf(wS + 60L, nextW)) else null
                 }
-                KaraokeLine(startMs, lineEnd, words.joinToString("") { it.text }.trim(), words, true)
+                KaraokeLine(startMs, lineEnd, words.joinToString("") { it.text }.trim(), words, true, finalTrans)
             } else {
                 val clean = stripEnhancedTags(body)
-                KaraokeLine(startMs, lineEnd, clean, if (enableAutoWord) interpolateWords(clean, startMs, lineEnd) else emptyList(), false)
+                KaraokeLine(startMs, lineEnd, clean, if (enableAutoWord) interpolateWords(clean, startMs, lineEnd) else emptyList(), false, finalTrans)
             }
         }
     }
@@ -311,6 +390,75 @@ private object EnhancedLrcEngine {
 }
 
 // === 3. CUSTOM VECTOR ICONS & UI COMPONENTS ===
+@Composable
+private fun KeepScreenOnEffect(enabled: Boolean) {
+    val context = LocalContext.current
+    DisposableEffect(context, enabled) {
+        val window = (context as? Activity)?.window
+        if (enabled) window?.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        else window?.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        onDispose { window?.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON) }
+    }
+}
+
+@Composable
+private fun SpinningVinylStage(
+    artworkUri: Uri?,
+    albumTitle: String,
+    isPlaying: Boolean,
+    accentColor: Color,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    val infinite = rememberInfiniteTransition(label = "vinylRot")
+    val angle by infinite.animateFloat(0f, 360f, infiniteRepeatable(tween(9000, easing = LinearEasing)), label = "vAng")
+    val tonearmAngle by animateFloatAsState(if (isPlaying) 22f else 0f, tween(500), label = "tArm")
+
+    Box(modifier = modifier.clickable { onClick() }, contentAlignment = Alignment.Center) {
+        Box(
+            modifier = Modifier
+                .size(204.dp)
+                .graphicsLayer { rotationZ = if (isPlaying) angle else 0f }
+                .clip(CircleShape)
+                .background(Brush.radialGradient(listOf(Color(0xFF2B2B2B), Color(0xFF0E0E0E), Color(0xFF222222), Color(0xFF080808))))
+                .border(3.dp, accentColor.copy(alpha = 0.45f), CircleShape),
+            contentAlignment = Alignment.Center
+        ) {
+            if (artworkUri != null) {
+                AsyncImage(
+                    model = artworkUri,
+                    contentDescription = null,
+                    modifier = Modifier.size(94.dp).clip(CircleShape).border(2.dp, accentColor, CircleShape),
+                    contentScale = ContentScale.Crop
+                )
+            } else {
+                LyraBrandLogo(size = 84.dp, cornerRadius = 42.dp)
+            }
+            Box(Modifier.size(18.dp).clip(CircleShape).background(Color(0xFF0B0D0A)).border(2.dp, accentColor, CircleShape))
+        }
+
+        Canvas(
+            modifier = Modifier
+                .size(116.dp)
+                .align(Alignment.TopEnd)
+                .padding(top = 8.dp, end = 18.dp)
+                .graphicsLayer {
+                    transformOrigin = TransformOrigin(0.8f, 0.2f)
+                    rotationZ = tonearmAngle
+                }
+        ) {
+            val pivot = Offset(size.width * 0.8f, size.height * 0.2f)
+            drawCircle(accentColor, radius = 14f, center = pivot)
+            drawLine(Color.LightGray, pivot, Offset(size.width * 0.35f, size.height * 0.78f), strokeWidth = 6f, cap = StrokeCap.Round)
+            drawRoundRect(accentColor, Offset(size.width * 0.26f, size.height * 0.74f), Size(22f, 14f), CornerRadius(4f, 4f))
+        }
+
+        Surface(color = Color.Black.copy(alpha = 0.6f), shape = RoundedCornerShape(12.dp), modifier = Modifier.align(Alignment.BottomCenter).padding(bottom = 6.dp)) {
+            Text("${albumTitle.ifBlank { "VINYL STUDIO" }.uppercase()} • KETUK KE LIRIK ♪", color = accentColor, style = MaterialTheme.typography.labelSmall, fontWeight = FontWeight.Bold, modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp))
+        }
+    }
+}
+
 @Composable
 private fun LyraVectorIcon(type: LyraIconType, tint: Color = Color.White, size: Dp = 22.dp, modifier: Modifier = Modifier) {
     Canvas(modifier = modifier.size(size)) {
@@ -469,44 +617,57 @@ private fun TrackList(tracks: List<AudioTrack>, currentUri: Uri?, playing: Boole
 }
 
 @Composable
-private fun KaraokeWordText(line: KaraokeLine, positionMs: Long, isCurrentLine: Boolean, fontSizeSp: Int, textAlign: TextAlign = TextAlign.Center, modifier: Modifier = Modifier) {
-    val activeColor = Color(0xFFB8F36B); val sungColor = Color.White
+private fun KaraokeWordText(line: KaraokeLine, positionMs: Long, isCurrentLine: Boolean, fontSizeSp: Int, accentColor: Color, textAlign: TextAlign = TextAlign.Center, modifier: Modifier = Modifier) {
+    val sungColor = Color.White
     val unsungColor = if (isCurrentLine) Color.White.copy(alpha = 0.42f) else Color.White.copy(alpha = 0.25f)
-    if (!isCurrentLine || line.words.isEmpty()) {
-        Text(line.plainText.ifBlank { "•••" }, fontSize = fontSizeSp.sp, fontWeight = if (isCurrentLine) FontWeight.ExtraBold else FontWeight.SemiBold, color = if (isCurrentLine) activeColor else unsungColor, textAlign = textAlign, lineHeight = (fontSizeSp + 7).sp, modifier = modifier)
-        return
-    }
-    val annotated = buildAnnotatedString {
-        for (word in line.words) {
-            when {
-                positionMs >= word.endMs -> withStyle(SpanStyle(color = sungColor, fontWeight = FontWeight.ExtraBold)) { append(word.text) }
-                positionMs in word.startMs until word.endMs -> {
-                    val dur = (word.endMs - word.startMs).coerceAtLeast(1L)
-                    val splitIdx = (word.text.length * ((positionMs - word.startMs).toFloat() / dur.toFloat()).coerceIn(0f, 1f)).toInt().coerceIn(0, word.text.length)
-                    withStyle(SpanStyle(color = activeColor, fontWeight = FontWeight.Black)) { append(word.text.take(splitIdx)) }
-                    withStyle(SpanStyle(color = activeColor.copy(alpha = 0.65f), fontWeight = FontWeight.ExtraBold)) { append(word.text.drop(splitIdx)) }
+    Column(modifier = modifier, horizontalAlignment = if (textAlign == TextAlign.Center) Alignment.CenterHorizontally else Alignment.Start) {
+        if (!isCurrentLine || line.words.isEmpty()) {
+            Text(line.plainText.ifBlank { "•••" }, fontSize = fontSizeSp.sp, fontWeight = if (isCurrentLine) FontWeight.ExtraBold else FontWeight.SemiBold, color = if (isCurrentLine) accentColor else unsungColor, textAlign = textAlign, lineHeight = (fontSizeSp + 7).sp)
+        } else {
+            val annotated = buildAnnotatedString {
+                for (word in line.words) {
+                    when {
+                        positionMs >= word.endMs -> withStyle(SpanStyle(color = sungColor, fontWeight = FontWeight.ExtraBold)) { append(word.text) }
+                        positionMs in word.startMs until word.endMs -> {
+                            val dur = (word.endMs - word.startMs).coerceAtLeast(1L)
+                            val splitIdx = (word.text.length * ((positionMs - word.startMs).toFloat() / dur.toFloat()).coerceIn(0f, 1f)).toInt().coerceIn(0, word.text.length)
+                            withStyle(SpanStyle(color = accentColor, fontWeight = FontWeight.Black)) { append(word.text.take(splitIdx)) }
+                            withStyle(SpanStyle(color = accentColor.copy(alpha = 0.65f), fontWeight = FontWeight.ExtraBold)) { append(word.text.drop(splitIdx)) }
+                        }
+                        else -> withStyle(SpanStyle(color = unsungColor, fontWeight = FontWeight.Bold)) { append(word.text) }
+                    }
                 }
-                else -> withStyle(SpanStyle(color = unsungColor, fontWeight = FontWeight.Bold)) { append(word.text) }
             }
+            Text(annotated, fontSize = fontSizeSp.sp, textAlign = textAlign, lineHeight = (fontSizeSp + 7).sp)
+        }
+        // Tampilan Dual-Language / Terjemahan Lirik Dua Baris
+        if (line.translationText.isNotBlank()) {
+            Spacer(Modifier.height(2.dp))
+            Text(
+                text = line.translationText,
+                fontSize = (fontSizeSp - 4).coerceAtLeast(12).sp,
+                fontStyle = FontStyle.Italic,
+                color = if (isCurrentLine) accentColor.copy(alpha = 0.85f) else Color.White.copy(alpha = 0.35f),
+                textAlign = textAlign
+            )
         }
     }
-    Text(annotated, fontSize = fontSizeSp.sp, textAlign = textAlign, lineHeight = (fontSizeSp + 7).sp, modifier = modifier)
 }
 
 @Composable
-private fun KaraokeMiniStage(lines: List<KaraokeLine>, positionMs: Long, hasEnhancedTag: Boolean, autoWordKaraoke: Boolean, onExpandClick: () -> Unit, onOpenSearchClick: () -> Unit) {
+private fun KaraokeMiniStage(lines: List<KaraokeLine>, positionMs: Long, hasEnhancedTag: Boolean, autoWordKaraoke: Boolean, accentColor: Color, onExpandClick: () -> Unit, onOpenSearchClick: () -> Unit) {
     val activeIdx = remember(lines, positionMs) { lines.indexOfLast { it.startMs <= positionMs }.coerceAtLeast(0) }
     val currentLine = lines.getOrNull(activeIdx); val nextLine = lines.getOrNull(activeIdx + 1)
     ElevatedCard(shape = RoundedCornerShape(22.dp), colors = CardDefaults.elevatedCardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant), modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp)) {
         Column(Modifier.fillMaxWidth().clickable { if (lines.isEmpty()) onOpenSearchClick() else onExpandClick() }.padding(horizontal = 16.dp, vertical = 10.dp), horizontalAlignment = Alignment.CenterHorizontally) {
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
-                Text(when { hasEnhancedTag -> "KARAOKE ENHANCED LRC ★"; autoWordKaraoke -> "AUTO-WORD KARAOKE"; else -> "SYNCED LRC (PER BARIS)" }, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.primary, fontWeight = FontWeight.Black)
-                Text(if (lines.isEmpty()) "Cari Lirik ⌕" else "Layar Penuh ↗", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.primary)
+                Text(when { hasEnhancedTag -> "KARAOKE ENHANCED LRC ★"; autoWordKaraoke -> "AUTO-WORD KARAOKE"; else -> "SYNCED LRC (PER BARIS)" }, style = MaterialTheme.typography.labelSmall, color = accentColor, fontWeight = FontWeight.Black)
+                Text(if (lines.isEmpty()) "Cari Lirik ⌕" else "Layar Penuh ↗", style = MaterialTheme.typography.labelSmall, color = accentColor)
             }
             Spacer(Modifier.height(4.dp))
             if (currentLine == null) Text("Lirik belum tersedia — ketuk untuk mencari lirik online", style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant, textAlign = TextAlign.Center, modifier = Modifier.padding(vertical = 6.dp))
             else {
-                KaraokeWordText(currentLine, positionMs, true, 17, TextAlign.Center, Modifier.fillMaxWidth())
+                KaraokeWordText(currentLine, positionMs, true, 17, accentColor, TextAlign.Center, Modifier.fillMaxWidth())
                 if (nextLine != null) { Spacer(Modifier.height(3.dp)); Text(nextLine.plainText.ifBlank { "•••" }, style = MaterialTheme.typography.bodySmall, color = Color.White.copy(alpha = 0.45f), maxLines = 1, overflow = TextOverflow.Ellipsis, textAlign = TextAlign.Center) }
             }
         }
@@ -514,11 +675,12 @@ private fun KaraokeMiniStage(lines: List<KaraokeLine>, positionMs: Long, hasEnha
 }
 
 @Composable
-private fun KaraokeFullStage(lines: List<KaraokeLine>, positionMs: Long, hasEnhancedTag: Boolean, autoWordKaraoke: Boolean, onToggleAutoWord: () -> Unit, onSeekTo: (Long) -> Unit, onEditLyricsClick: () -> Unit, modifier: Modifier = Modifier) {
+private fun KaraokeFullStage(lines: List<KaraokeLine>, positionMs: Long, hasEnhancedTag: Boolean, autoWordKaraoke: Boolean, accentColor: Color, darkBgColor: Color, onToggleAutoWord: () -> Unit, onShareClick: () -> Unit, onSeekTo: (Long) -> Unit, onEditLyricsClick: () -> Unit, modifier: Modifier = Modifier) {
+    KeepScreenOnEffect(enabled = true)
     val listState = rememberLazyListState()
     val activeIdx = remember(lines, positionMs) { lines.indexOfLast { it.startMs <= positionMs }.coerceAtLeast(0) }
     LaunchedEffect(activeIdx, lines.size) { if (lines.isNotEmpty() && activeIdx in lines.indices) listState.animateScrollToItem(index = activeIdx, scrollOffset = -170) }
-    Box(modifier.clip(RoundedCornerShape(26.dp)).background(Brush.verticalGradient(listOf(Color(0xFF1F2A16), Color(0xFF12170E), Color(0xFF0D0F0B)))).border(1.dp, Color.White.copy(alpha = 0.07f), RoundedCornerShape(26.dp)).padding(horizontal = 14.dp, vertical = 10.dp)) {
+    Box(modifier.clip(RoundedCornerShape(26.dp)).background(Brush.verticalGradient(listOf(darkBgColor, Color(0xFF12170E), Color(0xFF0D0F0B)))).border(1.dp, Color.White.copy(alpha = 0.07f), RoundedCornerShape(26.dp)).padding(horizontal = 14.dp, vertical = 10.dp)) {
         if (lines.isEmpty()) {
             Column(Modifier.fillMaxSize().padding(20.dp), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.Center) {
                 LyraBrandLogo(size = 64.dp, cornerRadius = 18.dp); Spacer(Modifier.height(12.dp))
@@ -534,20 +696,25 @@ private fun KaraokeFullStage(lines: List<KaraokeLine>, positionMs: Long, hasEnha
                     val alphaVal by animateFloatAsState(when { isCurrent -> 1f; distance == 1 -> 0.60f; distance == 2 -> 0.36f; else -> 0.20f }, tween(220), label = "kA")
                     Column(Modifier.fillMaxWidth().graphicsLayer { scaleX = scale; scaleY = scale }.alpha(alphaVal).clip(RoundedCornerShape(18.dp)).background(if (isCurrent) Color.White.copy(alpha = 0.08f) else Color.Transparent).clickable { onSeekTo(line.startMs) }.padding(horizontal = 14.dp, vertical = 10.dp)) {
                         Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.SpaceBetween, modifier = Modifier.fillMaxWidth()) {
-                            Text(formatTime(line.startMs), style = MaterialTheme.typography.labelSmall, color = if (isCurrent) Color(0xFFB8F36B) else Color.White.copy(alpha = 0.35f))
-                            if (isCurrent) Text("● AKTIF", style = MaterialTheme.typography.labelSmall, fontSize = 9.sp, color = Color(0xFFB8F36B), fontWeight = FontWeight.Black)
+                            Text(formatTime(line.startMs), style = MaterialTheme.typography.labelSmall, color = if (isCurrent) accentColor else Color.White.copy(alpha = 0.35f))
+                            if (isCurrent) Text("● AKTIF", style = MaterialTheme.typography.labelSmall, fontSize = 9.sp, color = accentColor, fontWeight = FontWeight.Black)
                         }
                         Spacer(Modifier.height(4.dp))
-                        KaraokeWordText(line, positionMs, isCurrent, if (isCurrent) 21 else 16, TextAlign.Start, Modifier.fillMaxWidth())
+                        KaraokeWordText(line, positionMs, isCurrent, if (isCurrent) 21 else 16, accentColor, TextAlign.Start, Modifier.fillMaxWidth())
                         if (isCurrent && line.words.isNotEmpty()) {
                             val lineProg = ((positionMs - line.startMs).toFloat() / (line.endMs - line.startMs).coerceAtLeast(1L).toFloat()).coerceIn(0f, 1f)
-                            LinearProgressIndicator(progress = { lineProg }, modifier = Modifier.fillMaxWidth(0.6f).padding(top = 8.dp).height(3.dp).clip(RoundedCornerShape(2.dp)), color = Color(0xFFB8F36B), trackColor = Color.White.copy(alpha = 0.15f))
+                            LinearProgressIndicator(progress = { lineProg }, modifier = Modifier.fillMaxWidth(0.6f).padding(top = 8.dp).height(3.dp).clip(RoundedCornerShape(2.dp)), color = accentColor, trackColor = Color.White.copy(alpha = 0.15f))
                         }
                     }
                 }
             }
-            Surface(color = Color.Black.copy(alpha = 0.72f), shape = RoundedCornerShape(12.dp), modifier = Modifier.align(Alignment.TopEnd).clickable { onToggleAutoWord() }) {
-                Text(when { hasEnhancedTag -> "ENHANCED LRC ★"; autoWordKaraoke -> "AUTO-WORD: ON"; else -> "AUTO-WORD: OFF" }, style = MaterialTheme.typography.labelSmall, color = if (hasEnhancedTag || autoWordKaraoke) Color(0xFFB8F36B) else Color.LightGray, fontWeight = FontWeight.Bold, modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp))
+            Row(modifier = Modifier.align(Alignment.TopEnd), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                Surface(color = Color.Black.copy(alpha = 0.72f), shape = RoundedCornerShape(12.dp), modifier = Modifier.clickable { onShareClick() }) {
+                    Text("Bagikan Kutipan ↗", style = MaterialTheme.typography.labelSmall, color = Color.White, fontWeight = FontWeight.Bold, modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp))
+                }
+                Surface(color = Color.Black.copy(alpha = 0.72f), shape = RoundedCornerShape(12.dp), modifier = Modifier.clickable { onToggleAutoWord() }) {
+                    Text(when { hasEnhancedTag -> "ENHANCED LRC ★"; autoWordKaraoke -> "AUTO-WORD: ON"; else -> "AUTO-WORD: OFF" }, style = MaterialTheme.typography.labelSmall, color = if (hasEnhancedTag || autoWordKaraoke) accentColor else Color.LightGray, fontWeight = FontWeight.Bold, modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp))
+                }
             }
         }
     }
@@ -560,9 +727,22 @@ private fun EqualizerPanel(audioSessionId: Int) {
     var range by remember(audioSessionId) { mutableFloatStateOf(1000f) }
     var labels by remember(audioSessionId) { mutableStateOf<List<String>>(listOf("60 Hz", "230 Hz", "910 Hz", "3.6 kHz", "14 kHz")) }
     var bass by remember(audioSessionId) { mutableFloatStateOf(0f) }
+    var virtualizerStrength by remember(audioSessionId) { mutableFloatStateOf(0f) }
+    var loudnessGainMb by remember(audioSessionId) { mutableFloatStateOf(0f) }
+    var selectedReverb by remember(audioSessionId) { mutableIntStateOf(0) }
+
     val eq = remember(audioSessionId) { if (audioSessionId > 0) runCatching { Equalizer(0, audioSessionId) }.getOrNull() else null }
     val bassBoost = remember(audioSessionId) { if (audioSessionId > 0) runCatching { BassBoost(0, audioSessionId) }.getOrNull() else null }
-    DisposableEffect(eq, bassBoost) { onDispose { runCatching { eq?.release() }; runCatching { bassBoost?.release() } } }
+    val virtualizer = remember(audioSessionId) { if (audioSessionId > 0) runCatching { Virtualizer(0, audioSessionId) }.getOrNull() else null }
+    val loudness = remember(audioSessionId) { if (audioSessionId > 0) runCatching { LoudnessEnhancer(audioSessionId) }.getOrNull() else null }
+    val reverb = remember(audioSessionId) { if (audioSessionId > 0) runCatching { PresetReverb(0, audioSessionId) }.getOrNull() else null }
+
+    DisposableEffect(eq, bassBoost, virtualizer, loudness, reverb) {
+        onDispose {
+            runCatching { eq?.release() }; runCatching { bassBoost?.release() }
+            runCatching { virtualizer?.release() }; runCatching { loudness?.release() }; runCatching { reverb?.release() }
+        }
+    }
     LaunchedEffect(eq) {
         if (eq != null) runCatching {
             val r = eq.bandLevelRange; range = maxOf(abs(r[0].toFloat()), abs(r[1].toFloat()))
@@ -572,8 +752,8 @@ private fun EqualizerPanel(audioSessionId: Int) {
             enabled = eq.enabled
         }
     }
-    if (audioSessionId <= 0 || eq == null) { Text("Mulai putar lagu untuk mengaktifkan equalizer.", style = MaterialTheme.typography.bodySmall); return }
-    Row(verticalAlignment = Alignment.CenterVertically) { Text("Equalizer Studio", Modifier.weight(1f), fontWeight = FontWeight.SemiBold); Switch(checked = enabled, onCheckedChange = { v -> enabled = v; runCatching { eq.enabled = v } }) }
+    if (audioSessionId <= 0 || eq == null) { Text("Mulai putar lagu untuk mengaktifkan studio equalizer & efek 3D.", style = MaterialTheme.typography.bodySmall); return }
+    Row(verticalAlignment = Alignment.CenterVertically) { Text("Equalizer & 3D Studio", Modifier.weight(1f), fontWeight = FontWeight.SemiBold); Switch(checked = enabled, onCheckedChange = { v -> enabled = v; runCatching { eq.enabled = v } }) }
     val presets = listOf(
         "Flat" to listOf(0f, 0f, 0f, 0f, 0f),
         "Bass+" to listOf(0.7f, 0.4f, 0f, 0.1f, 0.2f),
@@ -601,10 +781,38 @@ private fun EqualizerPanel(audioSessionId: Int) {
         }
     }
     if (bassBoost != null) {
-        Row(verticalAlignment = Alignment.CenterVertically) { Text("Bass boost", Modifier.weight(1f), style = MaterialTheme.typography.bodyMedium); Text("${bass.toInt()}%", style = MaterialTheme.typography.labelSmall) }
+        Row(verticalAlignment = Alignment.CenterVertically) { Text("Bass Boost", Modifier.weight(1f), style = MaterialTheme.typography.bodyMedium); Text("${bass.toInt()}%", style = MaterialTheme.typography.labelSmall) }
         Slider(value = bass, onValueChange = { next -> bass = next; runCatching { bassBoost.setStrength((next * 10).toInt().toShort()); bassBoost.enabled = next > 0f } }, valueRange = 0f..100f)
     }
-    TextButton(onClick = { bandValues = List(bandValues.size) { 0f }; bandValues.forEachIndexed { i, _ -> runCatching { eq.setBandLevel(i.toShort(), 0.toShort()) } }; bass = 0f; runCatching { bassBoost?.setStrength(0.toShort()); bassBoost?.let { it.enabled = false } } }) { Text("Reset audio") }
+    if (virtualizer != null) {
+        Row(verticalAlignment = Alignment.CenterVertically) { Text("3D Surround Virtualizer", Modifier.weight(1f), style = MaterialTheme.typography.bodyMedium); Text("${virtualizerStrength.toInt()}%", style = MaterialTheme.typography.labelSmall) }
+        Slider(value = virtualizerStrength, onValueChange = { next -> virtualizerStrength = next; runCatching { virtualizer.setStrength((next * 10).toInt().toShort()); virtualizer.enabled = next > 0f } }, valueRange = 0f..100f)
+    }
+    if (loudness != null) {
+        Row(verticalAlignment = Alignment.CenterVertically) { Text("Vocal & Clarity Gain", Modifier.weight(1f), style = MaterialTheme.typography.bodyMedium); Text("+${(loudnessGainMb / 100f).toInt()} dB", style = MaterialTheme.typography.labelSmall) }
+        Slider(value = loudnessGainMb, onValueChange = { next -> loudnessGainMb = next; runCatching { loudness.setTargetGain(next.toInt()); loudness.enabled = next > 0f } }, valueRange = 0f..1500f)
+    }
+    if (reverb != null) {
+        Text("Hall Reverb (Efek Ruangan Karaoke)", style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.SemiBold)
+        val reverbPresets = listOf("Off" to PresetReverb.PRESET_NONE.toInt(), "Small Room" to PresetReverb.PRESET_SMALLROOM.toInt(), "Medium Hall" to PresetReverb.PRESET_MEDIUMHALL.toInt(), "Large Hall" to PresetReverb.PRESET_LARGEHALL.toInt(), "Plate" to PresetReverb.PRESET_PLATE.toInt())
+        Row(Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+            reverbPresets.forEach { (label, code) ->
+                FilterChip(
+                    selected = selectedReverb == code,
+                    onClick = { selectedReverb = code; runCatching { reverb.preset = code.toShort(); reverb.enabled = code != PresetReverb.PRESET_NONE.toInt() } },
+                    label = { Text(label, fontSize = 11.sp) }
+                )
+            }
+        }
+    }
+    TextButton(onClick = {
+        bandValues = List(bandValues.size) { 0f }; bandValues.forEachIndexed { i, _ -> runCatching { eq.setBandLevel(i.toShort(), 0.toShort()) } }
+        bass = 0f; virtualizerStrength = 0f; loudnessGainMb = 0f; selectedReverb = 0
+        runCatching { bassBoost?.setStrength(0.toShort()); bassBoost?.let { it.enabled = false } }
+        runCatching { virtualizer?.setStrength(0.toShort()); virtualizer?.let { it.enabled = false } }
+        runCatching { loudness?.setTargetGain(0); loudness?.let { it.enabled = false } }
+        runCatching { reverb?.let { it.enabled = false } }
+    }) { Text("Reset semua efek audio") }
 }
 
 @Composable
@@ -612,6 +820,7 @@ private fun AudioVisualizer(
     audioSessionId: Int,
     isPlaying: Boolean,
     style: VisualizerStyle,
+    accentColor: Color,
     onCycleStyle: () -> Unit,
     modifier: Modifier = Modifier
 ) {
@@ -676,11 +885,11 @@ private fun AudioVisualizer(
             Text(
                 "SPECTRUM: ${style.label.uppercase()} ↻",
                 style = MaterialTheme.typography.labelSmall,
-                color = MaterialTheme.colorScheme.primary,
+                color = accentColor,
                 fontWeight = FontWeight.Bold,
                 modifier = Modifier.clickable { onCycleStyle() }
             )
-            if (!hasPermission) Text("Izinkan mikrofon (FFT) →", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.primary, modifier = Modifier.clickable { permissionLauncher.launch(Manifest.permission.RECORD_AUDIO) })
+            if (!hasPermission) Text("Izinkan mikrofon (FFT) →", style = MaterialTheme.typography.labelSmall, color = accentColor, modifier = Modifier.clickable { permissionLauncher.launch(Manifest.permission.RECORD_AUDIO) })
             else Text(when { !isPlaying -> "STANDBY"; hasActiveSignal && !captureError -> "REAL-TIME FFT"; else -> "PULSE ENGINE" }, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
         }
         Canvas(Modifier.fillMaxWidth().height(48.dp).clickable { onCycleStyle() }) {
@@ -691,14 +900,14 @@ private fun AudioVisualizer(
                 VisualizerStyle.NEON_BARS -> {
                     for (i in 0 until count) {
                         val h = size.height * renderSpectrum[i].coerceIn(0.04f, 1f)
-                        drawRoundRect(Brush.verticalGradient(listOf(Color(0xFFD9FF9A), Color(0xFF8FE03C), Color(0xFF315B18))), Offset(i * (barWidth + gap), size.height - h), Size(barWidth, h), CornerRadius(barWidth / 2f, barWidth / 2f))
+                        drawRoundRect(Brush.verticalGradient(listOf(Color.White, accentColor, accentColor.copy(alpha = 0.25f))), Offset(i * (barWidth + gap), size.height - h), Size(barWidth, h), CornerRadius(barWidth / 2f, barWidth / 2f))
                     }
                 }
                 VisualizerStyle.MIRROR_WAVE -> {
                     val centerY = size.height / 2f
                     for (i in 0 until count) {
                         val h = (size.height * renderSpectrum[i].coerceIn(0.06f, 1f)).coerceAtLeast(4f)
-                        drawRoundRect(Brush.verticalGradient(listOf(Color(0xFF8FE03C), Color(0xFFD9FF9A), Color(0xFF8FE03C))), Offset(i * (barWidth + gap), centerY - h / 2f), Size(barWidth, h), CornerRadius(barWidth / 2f, barWidth / 2f))
+                        drawRoundRect(Brush.verticalGradient(listOf(accentColor, Color.White, accentColor)), Offset(i * (barWidth + gap), centerY - h / 2f), Size(barWidth, h), CornerRadius(barWidth / 2f, barWidth / 2f))
                     }
                 }
                 VisualizerStyle.CYBER_DOTS -> {
@@ -706,8 +915,8 @@ private fun AudioVisualizer(
                         val frac = renderSpectrum[i].coerceIn(0.05f, 1f)
                         val x = i * (barWidth + gap) + barWidth / 2f
                         val y = size.height - (size.height * frac)
-                        drawLine(Color(0xFF315B18).copy(alpha = 0.55f), Offset(x, size.height), Offset(x, y), strokeWidth = barWidth * 0.45f)
-                        drawCircle(Color(0xFFD9FF9A), radius = barWidth * 0.65f, center = Offset(x, y.coerceIn(4f, size.height - 4f)))
+                        drawLine(accentColor.copy(alpha = 0.35f), Offset(x, size.height), Offset(x, y), strokeWidth = barWidth * 0.45f)
+                        drawCircle(accentColor, radius = barWidth * 0.65f, center = Offset(x, y.coerceIn(4f, size.height - 4f)))
                     }
                 }
                 VisualizerStyle.PULSE_LINE -> {
@@ -717,7 +926,7 @@ private fun AudioVisualizer(
                         val y = size.height - (size.height * renderSpectrum[i].coerceIn(0.05f, 0.95f))
                         if (i == 0) path.moveTo(x, y) else path.lineTo(x, y)
                     }
-                    drawPath(path, Brush.horizontalGradient(listOf(Color(0xFF8FE03C), Color(0xFFD9FF9A), Color(0xFF8FE03C))), style = Stroke(width = 3.5f, cap = StrokeCap.Round, join = StrokeJoin.Round))
+                    drawPath(path, Brush.horizontalGradient(listOf(accentColor, Color.White, accentColor)), style = Stroke(width = 3.5f, cap = StrokeCap.Round, join = StrokeJoin.Round))
                 }
             }
         }
@@ -747,17 +956,29 @@ private fun LyraApp() {
 
     var tab by remember { mutableStateOf(LyraTab.HOME) }
     var librarySubTab by remember { mutableStateOf(LibrarySubTab.ALL) }
+    var selectedBrowseFolder by remember { mutableStateOf<String?>(null) }
     var lyricsSubTab by remember { mutableStateOf(LyricsSubTab.PREVIEW) }
     var isSearchingLyrics by remember { mutableStateOf(false) }
 
     var minDurationSec by remember { mutableIntStateOf(prefs.getInt("min_duration_sec", 30)) }
     var sortOption by remember { mutableStateOf(runCatching { SortOption.valueOf(prefs.getString("sort_option", SortOption.DATE_ADDED_DESC.name).orEmpty()) }.getOrDefault(SortOption.DATE_ADDED_DESC)) }
     var visualizerStyle by remember { mutableStateOf(runCatching { VisualizerStyle.valueOf(prefs.getString("visualizer_style", VisualizerStyle.NEON_BARS.name).orEmpty()) }.getOrDefault(VisualizerStyle.NEON_BARS)) }
+    var themePreset by remember { mutableStateOf(runCatching { ThemeAccent.valueOf(prefs.getString("theme_preset", ThemeAccent.DYNAMIC.name).orEmpty()) }.getOrDefault(ThemeAccent.DYNAMIC)) }
+    var vinylMode by remember { mutableStateOf(prefs.getBoolean("vinyl_mode", true)) }
+    var smoothFadePause by remember { mutableStateOf(prefs.getBoolean("smooth_fade", true)) }
     var autoWordKaraoke by remember { mutableStateOf(prefs.getBoolean("auto_word_karaoke", true)) }
+    var bluetoothLiveLyrics by remember { mutableStateOf(prefs.getBoolean("bt_live_lyrics", false)) }
+
+    // Karaoke Voice Recorder State
+    var isRecordingKaraoke by remember { mutableStateOf(false) }
+    var recordingSeconds by remember { mutableIntStateOf(0) }
+    var activeRecorder by remember { mutableStateOf<MediaRecorder?>(null) }
+    var lastRecordedPath by remember { mutableStateOf("") }
 
     var playbackSpeed by remember { mutableFloatStateOf(1.0f) }
     var pitchSemitones by remember { mutableIntStateOf(0) }
     var showAudioLabDialog by remember { mutableStateOf(false) }
+    var showShareQuoteDialog by remember { mutableStateOf(false) }
     var loopStartMs by remember { mutableStateOf<Long?>(null) }
     var loopEndMs by remember { mutableStateOf<Long?>(null) }
 
@@ -805,6 +1026,74 @@ private fun LyraApp() {
 
     fun permissionName() = if (Build.VERSION.SDK_INT >= 33) Manifest.permission.READ_MEDIA_AUDIO else Manifest.permission.READ_EXTERNAL_STORAGE
 
+    val micPermLauncher = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+        if (!granted) status = "Izin mikrofon diperlukan untuk merekam karaoke."
+    }
+
+    fun toggleKaraokeRecording() {
+        if (isRecordingKaraoke) {
+            runCatching {
+                activeRecorder?.stop()
+                activeRecorder?.release()
+            }
+            activeRecorder = null
+            isRecordingKaraoke = false
+            status = "Rekaman Karaoke tersimpan: $lastRecordedPath"
+        } else {
+            if (ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+                micPermLauncher.launch(Manifest.permission.RECORD_AUDIO)
+                return
+            }
+            runCatching {
+                val outDir = context.getExternalFilesDir(Environment.DIRECTORY_MUSIC) ?: context.filesDir
+                val cleanName = currentTitle.replace(Regex("[^a-zA-Z0-9_-]"), "_").take(25).ifBlank { "Lyra" }
+                val outFile = File(outDir, "Karaoke_${cleanName}_${System.currentTimeMillis() / 1000}.m4a")
+                val rec = if (Build.VERSION.SDK_INT >= 31) MediaRecorder(context) else @Suppress("DEPRECATION") MediaRecorder()
+                rec.setAudioSource(MediaRecorder.AudioSource.MIC)
+                rec.setOutputFormat(MediaRecorder.OutputFormat.MPEG_4)
+                rec.setAudioEncoder(MediaRecorder.AudioEncoder.AAC)
+                rec.setAudioEncodingBitRate(128000)
+                rec.setAudioSamplingRate(44100)
+                rec.setOutputFile(outFile.absolutePath)
+                rec.prepare()
+                rec.start()
+                activeRecorder = rec
+                lastRecordedPath = outFile.name
+                recordingSeconds = 0
+                isRecordingKaraoke = true
+                status = "Merekam suara karaoke..."
+            }.onFailure {
+                status = "Gagal memulai perekam: ${it.message}"
+            }
+        }
+    }
+
+    LaunchedEffect(isRecordingKaraoke) {
+        while (isRecordingKaraoke) {
+            delay(1000)
+            recordingSeconds += 1
+        }
+    }
+
+    fun togglePlayWithFade() {
+        val c = controller ?: return
+        if (playing) {
+            if (smoothFadePause) {
+                scope.launch {
+                    for (step in 4 downTo 1) {
+                        runCatching { c.volume = step * 0.2f }
+                        delay(45)
+                    }
+                    c.pause()
+                    runCatching { c.volume = 1.0f }
+                }
+            } else c.pause()
+        } else {
+            runCatching { c.volume = 1.0f }
+            c.play()
+        }
+    }
+
     fun applyPlaybackParams(speed: Float, semitones: Int) {
         val pitchFactor = 2.0.pow(semitones / 12.0).toFloat().coerceIn(0.5f, 2.0f)
         runCatching { controller?.playbackParameters = PlaybackParameters(speed.coerceIn(0.5f, 2.0f), pitchFactor) }
@@ -834,9 +1123,7 @@ private fun LyraApp() {
     }
 
     fun findOverrideFor(id: String, uriStr: String, filePath: String = "", overrides: Map<String, MetadataOverride> = metadataOverrides): MetadataOverride? {
-        return overrides[id]
-            ?: overrides[uriStr]
-            ?: (if (filePath.isNotBlank()) overrides["path:$filePath"] else null)
+        return overrides[id] ?: overrides[uriStr] ?: (if (filePath.isNotBlank()) overrides["path:$filePath"] else null)
     }
 
     fun applyTrackOverride(raw: AudioTrack, overrides: Map<String, MetadataOverride> = metadataOverrides): AudioTrack {
@@ -860,14 +1147,9 @@ private fun LyraApp() {
             metadataOverrides = latestOverrides
             val collection = MediaStore.Audio.Media.EXTERNAL_CONTENT_URI
             val projection = arrayOf(
-                MediaStore.Audio.Media._ID,
-                MediaStore.Audio.Media.TITLE,
-                MediaStore.Audio.Media.ARTIST,
-                MediaStore.Audio.Media.ALBUM,
-                MediaStore.Audio.Media.DURATION,
-                MediaStore.Audio.Media.DATA,
-                MediaStore.Audio.Media.ALBUM_ID,
-                MediaStore.Audio.Media.DATE_ADDED
+                MediaStore.Audio.Media._ID, MediaStore.Audio.Media.TITLE, MediaStore.Audio.Media.ARTIST,
+                MediaStore.Audio.Media.ALBUM, MediaStore.Audio.Media.DURATION, MediaStore.Audio.Media.DATA,
+                MediaStore.Audio.Media.ALBUM_ID, MediaStore.Audio.Media.DATE_ADDED
             )
             val found = linkedMapOf<String, AudioTrack>()
             context.contentResolver.query(collection, projection, "${MediaStore.Audio.Media.IS_MUSIC} != 0", null, "${MediaStore.Audio.Media.DATE_ADDED} DESC")?.use { cursor: Cursor ->
@@ -888,18 +1170,7 @@ private fun LyraApp() {
                     val albumId = if (albumIdCol >= 0) cursor.getLong(albumIdCol) else 0L
                     val addedSec = if (dateAddedCol >= 0) cursor.getLong(dateAddedCol) else 0L
                     val art = if (albumId > 0L) ContentUris.withAppendedId(Uri.parse("content://media/external/audio/albumart"), albumId) else null
-                    val rawTrack = AudioTrack(
-                        id = "media:$id",
-                        uri = Uri.withAppendedPath(collection, id),
-                        title = title,
-                        artist = artist,
-                        album = album,
-                        duration = cursor.getLong(durationCol),
-                        dateAddedSec = addedSec,
-                        filePath = path,
-                        folder = path.substringBeforeLast("/", ""),
-                        artworkUri = art
-                    )
+                    val rawTrack = AudioTrack("media:$id", Uri.withAppendedPath(collection, id), title, artist, album, cursor.getLong(durationCol), addedSec, path, path.substringBeforeLast("/", ""), artworkUri = art)
                     found["media:$id"] = applyTrackOverride(rawTrack, latestOverrides)
                 }
             }
@@ -998,7 +1269,7 @@ private fun LyraApp() {
             val s = applyTrackOverride(rawSong)
             MediaItem.Builder().setUri(s.uri).setMediaId(s.id).setMediaMetadata(MediaMetadata.Builder().setTitle(s.title).setArtist(s.artist).setAlbumTitle(s.album).setArtworkUri(s.artworkUri).build()).build()
         }
-        c.setMediaItems(items, index, 0L); c.prepare(); c.play()
+        c.setMediaItems(items, index, 0L); c.prepare(); runCatching { c.volume = 1.0f }; c.play()
         val tr = applyTrackOverride(list[index])
         currentTitle = tr.title; currentArtist = tr.artist; currentAlbum = tr.album; currentUri = tr.uri
         loopStartMs = null; loopEndMs = null
@@ -1014,7 +1285,10 @@ private fun LyraApp() {
         val token = SessionToken(context, ComponentName(context, PlaybackService::class.java))
         val future: ListenableFuture<MediaController> = MediaController.Builder(context, token).buildAsync()
         future.addListener({ try { controller = future.get() } catch (_: Exception) {} }, context.mainExecutor)
-        onDispose { MediaController.releaseFuture(future) }
+        onDispose {
+            runCatching { activeRecorder?.stop(); activeRecorder?.release() }
+            MediaController.releaseFuture(future)
+        }
     }
 
     LaunchedEffect(Unit) {
@@ -1022,9 +1296,10 @@ private fun LyraApp() {
         else permissionLauncher.launch(permissionName())
     }
 
-    LaunchedEffect(controller, metadataOverrides, songs, loopStartMs, loopEndMs) {
+    LaunchedEffect(controller, metadataOverrides, songs, loopStartMs, loopEndMs, bluetoothLiveLyrics) {
         val c = controller ?: return@LaunchedEffect
         var lastWidgetSync = 0L
+        var lastBtLyricSent = ""
         while (true) {
             playing = c.isPlaying; audioSessionId = prefs.getInt("audio_session_id", 0)
             position = c.currentPosition.coerceAtLeast(0L)
@@ -1033,8 +1308,7 @@ private fun LyraApp() {
 
             val lStart = loopStartMs; val lEnd = loopEndMs
             if (lStart != null && lEnd != null && lEnd > lStart + 500L && position >= lEnd) {
-                c.seekTo(lStart)
-                position = lStart
+                c.seekTo(lStart); position = lStart
             }
 
             val activeUri = c.currentMediaItem?.localConfiguration?.uri; currentUri = activeUri
@@ -1042,27 +1316,56 @@ private fun LyraApp() {
             val matchedSong = songs.firstOrNull { it.id == activeMediaId || it.uri == activeUri }
             val ov = findOverrideFor(activeMediaId, activeUri?.toString().orEmpty(), matchedSong?.filePath.orEmpty())
 
-            currentTitle = ov?.title?.takeIf { it.isNotBlank() } ?: matchedSong?.title?.takeIf { it.isNotBlank() } ?: c.mediaMetadata.title?.toString()?.takeIf { it.isNotBlank() } ?: currentTitle
+            currentTitle = ov?.title?.takeIf { it.isNotBlank() } ?: matchedSong?.title?.takeIf { it.isNotBlank() } ?: c.mediaMetadata.title?.toString()?.takeIf { it.isNotBlank() && !it.startsWith("♪ ") } ?: currentTitle
             currentArtist = ov?.artist?.takeIf { it.isNotBlank() } ?: matchedSong?.artist?.takeIf { it.isNotBlank() } ?: c.mediaMetadata.artist?.toString()?.takeIf { it.isNotBlank() } ?: currentArtist
             currentAlbum = ov?.album?.takeIf { it.isNotBlank() } ?: matchedSong?.album?.takeIf { it.isNotBlank() } ?: c.mediaMetadata.albumTitle?.toString() ?: currentAlbum
 
             currentLyric = EnhancedLrcEngine.stripEnhancedTags(LrcParser.displayLine(lrcText, position))
             val now = System.currentTimeMillis()
-            if (now - lastWidgetSync > 450L) { lastWidgetSync = now; LyricsWidgetProvider.updateAll(context, currentTitle, currentLyric) }
+            if (now - lastWidgetSync > 450L) {
+                lastWidgetSync = now
+                LyricsWidgetProvider.updateAll(context, currentTitle, currentLyric)
+                // Kirim lirik live ke layar mobil / Smartwatch Bluetooth AVRCP jika diaktifkan
+                if (bluetoothLiveLyrics && currentLyric.isNotBlank() && currentLyric != lastBtLyricSent) {
+                    lastBtLyricSent = currentLyric
+                    val idx = c.currentMediaItemIndex
+                    if (idx >= 0 && idx < c.mediaItemCount) {
+                        runCatching {
+                            val item = c.getMediaItemAt(idx)
+                            val btMeta = item.mediaMetadata.buildUpon()
+                                .setTitle("♪ $currentLyric")
+                                .setArtist("$currentTitle • $currentArtist")
+                                .build()
+                            c.replaceMediaItem(idx, item.buildUpon().setMediaMetadata(btMeta).build())
+                        }
+                    }
+                }
+            }
             delay(45)
         }
     }
 
-    LaunchedEffect(currentTitle, currentArtist, autoLyrics) {
+    LaunchedEffect(currentTitle, currentArtist, currentUri, autoLyrics) {
         val rawT = currentTitle.trim(); val rawA = currentArtist.trim()
         if (rawT.isBlank() || rawT == "Belum ada lagu" || rawT == "Judul tidak diketahui") return@LaunchedEffect
         val (cleanT, cleanA) = cleanSearchQuery(rawT, rawA)
         if (searchTrack.isBlank()) { searchTrack = cleanT; searchArtist = cleanA }
         val key = lyricsCacheKey(rawT, rawA)
         if (prefs.getString("current_lrc_key", "") != key) { lrcText = ""; currentLyric = ""; prefs.edit().putString("current_lrc", "").apply() }
+
+        val activeSong = songs.firstOrNull { it.uri == currentUri }
+        val localSidecar = activeSong?.filePath?.let { tryReadLocalSidecarLrc(it) }
+        if (localSidecar != null) {
+            lrcText = localSidecar
+            saveLrcToCache(localSidecar, rawT, rawA)
+            lyricsStatus = "Lirik dimuat otomatis dari file .LRC folder lokal"
+            return@LaunchedEffect
+        }
+
         val cache = runCatching { JSONObject(prefs.getString("lyrics_cache_json", "{}").orEmpty()) }.getOrElse { JSONObject() }
         val cached = cache.optString(key, "").takeIf { it.isNotBlank() && it != "null" }
         if (cached != null) { lrcText = cached; prefs.edit().putString("current_lrc", cached).putString("current_lrc_key", key).apply(); lyricsStatus = "Lirik dimuat dari cache lokal"; return@LaunchedEffect }
+
         if (!autoLyrics) { lyricsStatus = "Lirik otomatis nonaktif."; return@LaunchedEffect }
         isSearchingLyrics = true; lyricsStatus = "Mencari lirik otomatis: $cleanT..."
         try {
@@ -1078,7 +1381,21 @@ private fun LyraApp() {
     }
 
     LaunchedEffect(sleepMinutes) {
-        if (sleepMinutes > 0) { delay(sleepMinutes * 60_000L); controller?.pause(); sleepMinutes = 0; status = "Timer tidur selesai." }
+        if (sleepMinutes > 0) {
+            delay(sleepMinutes * 60_000L)
+            val c = controller
+            if (c != null && smoothFadePause) {
+                for (step in 10 downTo 1) {
+                    runCatching { c.volume = step * 0.1f }
+                    delay(120)
+                }
+                c.pause()
+                runCatching { c.volume = 1.0f }
+            } else {
+                c?.pause()
+            }
+            sleepMinutes = 0; status = "Timer tidur selesai (musik dijeda dengan halus)."
+        }
     }
 
     val durationFilteredSongs = remember(songs, minDurationSec) {
@@ -1101,16 +1418,30 @@ private fun LyraApp() {
         }
     }
 
+    val folderGroups = remember(durationFilteredSongs) {
+        durationFilteredSongs.groupBy { it.folder.ifBlank { "Penyimpanan Internal" } }.entries.sortedBy { it.key.lowercase(Locale.ROOT) }
+    }
+
     val currentTrack = songs.firstOrNull { it.uri == currentUri }
     val recentTracks = lastPlayed.mapNotNull { id -> durationFilteredSongs.firstOrNull { it.id == id } }
     val favoriteTracks = sortedAndFilteredSongs.filter { it.id in favoriteIds }
-    val playlistTracks: List<AudioTrack> = if (selectedPlaylist == "Favorit") favoriteTracks else {
-        val activeName = selectedPlaylist
-        if (activeName != null) playlists.firstOrNull { p -> p.name == activeName }?.trackIds?.mapNotNull { id -> songs.firstOrNull { s -> s.id == id } }.orEmpty() else emptyList()
+    val topPlayedTracks = remember(durationFilteredSongs, playCounts) { durationFilteredSongs.filter { (playCounts[it.id] ?: 0) > 0 }.sortedByDescending { playCounts[it.id] ?: 0 }.take(25) }
+    val recentlyAddedTracks = remember(durationFilteredSongs) { durationFilteredSongs.sortedByDescending { it.dateAddedSec }.take(30) }
+    val neverPlayedTracks = remember(durationFilteredSongs, playCounts) { durationFilteredSongs.filter { (playCounts[it.id] ?: 0) == 0 } }
+
+    val playlistTracks: List<AudioTrack> = when (selectedPlaylist) {
+        "Favorit" -> favoriteTracks
+        "Top 25 Sering Diputar" -> topPlayedTracks
+        "Baru Ditambahkan" -> recentlyAddedTracks
+        "Belum Pernah Diputar" -> neverPlayedTracks
+        else -> {
+            val activeName = selectedPlaylist
+            if (activeName != null) playlists.firstOrNull { p -> p.name == activeName }?.trackIds?.mapNotNull { id -> songs.firstOrNull { s -> s.id == id } }.orEmpty() else emptyList()
+        }
     }
 
-    val accent = Color(0xFFB8F36B)
-    val colors = if (darkMode) darkColorScheme(primary = accent, secondary = accent, background = Color(0xFF0B0D0A), surface = Color(0xFF161914), surfaceVariant = Color(0xFF232820))
+    val (dynamicAccent, dynamicDarkBg) = remember(themePreset, currentTitle) { resolveThemeColors(themePreset, currentTitle) }
+    val colors = if (darkMode) darkColorScheme(primary = dynamicAccent, secondary = dynamicAccent, background = Color(0xFF0B0D0A), surface = Color(0xFF161914), surfaceVariant = Color(0xFF232820))
     else lightColorScheme(primary = Color(0xFF4D6E16), secondary = Color(0xFF4D6E16))
 
     MaterialTheme(colorScheme = colors) {
@@ -1124,6 +1455,11 @@ private fun LyraApp() {
                         }
                     },
                     actions = {
+                        if (isRecordingKaraoke) {
+                            Surface(color = Color(0xFFD32F2F), shape = RoundedCornerShape(12.dp), modifier = Modifier.clickable { toggleKaraokeRecording() }.padding(end = 6.dp)) {
+                                Text("● REC ${formatTime(recordingSeconds * 1000L)}", color = Color.White, style = MaterialTheme.typography.labelSmall, fontWeight = FontWeight.Bold, modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp))
+                            }
+                        }
                         IconButton(onClick = { librarySubTab = LibrarySubTab.ALL; tab = LyraTab.LIBRARY }) { LyraVectorIcon(LyraIconType.SEARCH, tint = MaterialTheme.colorScheme.primary, size = 20.dp) }
                         TextButton(onClick = { if (ContextCompat.checkSelfPermission(context, permissionName()) == PackageManager.PERMISSION_GRANTED) scanSongs() else permissionLauncher.launch(permissionName()) }) { Text("Pindai") }
                     }
@@ -1142,7 +1478,7 @@ private fun LyraApp() {
                                         Text(currentLyric.ifBlank { currentArtist.ifBlank { "Ketuk untuk membuka layar putar" } }, maxLines = 1, overflow = TextOverflow.Ellipsis, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.primary)
                                     }
                                     IconButton(onClick = { controller?.seekToPreviousMediaItem() }) { LyraVectorIcon(LyraIconType.PREV, tint = Color.White, size = 18.dp) }
-                                    FilledTonalIconButton(onClick = { if (playing) controller?.pause() else controller?.play() }) { LyraVectorIcon(if (playing) LyraIconType.PAUSE else LyraIconType.PLAY, tint = MaterialTheme.colorScheme.primary, size = 20.dp) }
+                                    FilledTonalIconButton(onClick = { togglePlayWithFade() }) { LyraVectorIcon(if (playing) LyraIconType.PAUSE else LyraIconType.PLAY, tint = MaterialTheme.colorScheme.primary, size = 20.dp) }
                                     IconButton(onClick = { controller?.seekToNextMediaItem() }) { LyraVectorIcon(LyraIconType.NEXT, tint = Color.White, size = 18.dp) }
                                 }
                                 if (duration > 0) LinearProgressIndicator(progress = { (position.toFloat() / duration.toFloat()).coerceIn(0f, 1f) }, modifier = Modifier.fillMaxWidth().padding(top = 6.dp).height(3.dp).clip(RoundedCornerShape(2.dp)), color = MaterialTheme.colorScheme.primary)
@@ -1178,7 +1514,7 @@ private fun LyraApp() {
                                     Text(currentArtist.ifBlank { "Pilih lagu untuk mulai" }, style = MaterialTheme.typography.bodySmall, maxLines = 1, overflow = TextOverflow.Ellipsis)
                                     Text("Urutan: ${sortOption.label} · ≥${minDurationSec}s", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.primary, modifier = Modifier.padding(top = 4.dp))
                                 }
-                                FilledTonalIconButton(onClick = { if (playing) controller?.pause() else if (currentUri != null) controller?.play() else if (sortedAndFilteredSongs.isNotEmpty()) playTracks(sortedAndFilteredSongs, 0) }, modifier = Modifier.size(48.dp)) {
+                                FilledTonalIconButton(onClick = { if (currentUri != null || playing) togglePlayWithFade() else if (sortedAndFilteredSongs.isNotEmpty()) playTracks(sortedAndFilteredSongs, 0) }, modifier = Modifier.size(48.dp)) {
                                     LyraVectorIcon(if (playing) LyraIconType.PAUSE else LyraIconType.PLAY, tint = MaterialTheme.colorScheme.primary, size = 22.dp)
                                 }
                             }
@@ -1186,8 +1522,8 @@ private fun LyraApp() {
                         Spacer(Modifier.height(12.dp))
                         Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
                             SummaryCard("Lagu (≥${minDurationSec}s)", durationFilteredSongs.size.toString(), Modifier.weight(1f)) { librarySubTab = LibrarySubTab.ALL; tab = LyraTab.LIBRARY }
-                            SummaryCard("Favorit", favoriteTracks.size.toString(), Modifier.weight(1f)) { librarySubTab = LibrarySubTab.FAVORITES; tab = LyraTab.LIBRARY }
-                            SummaryCard("Playlist", playlists.size.toString(), Modifier.weight(1f)) { librarySubTab = LibrarySubTab.PLAYLISTS; tab = LyraTab.LIBRARY }
+                            SummaryCard("Folder", folderGroups.size.toString(), Modifier.weight(1f)) { librarySubTab = LibrarySubTab.FOLDERS; tab = LyraTab.LIBRARY }
+                            SummaryCard("Playlist", (playlists.size + 4).toString(), Modifier.weight(1f)) { librarySubTab = LibrarySubTab.PLAYLISTS; tab = LyraTab.LIBRARY }
                         }
                         Spacer(Modifier.height(10.dp))
                         Row(verticalAlignment = Alignment.CenterVertically) {
@@ -1208,30 +1544,82 @@ private fun LyraApp() {
                         Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.SpaceBetween) {
                             Row(Modifier.clip(RoundedCornerShape(20.dp)).background(MaterialTheme.colorScheme.surfaceVariant).padding(3.dp), horizontalArrangement = Arrangement.spacedBy(4.dp)) {
                                 Surface(shape = RoundedCornerShape(16.dp), color = if (!showFullKaraokeInPlayer) MaterialTheme.colorScheme.primary else Color.Transparent, modifier = Modifier.clickable { showFullKaraokeInPlayer = false }) {
-                                    Text("Sampul & Spektrum", Modifier.padding(horizontal = 12.dp, vertical = 6.dp), style = MaterialTheme.typography.labelMedium, fontWeight = FontWeight.Bold, color = if (!showFullKaraokeInPlayer) Color(0xFF101010) else MaterialTheme.colorScheme.onSurfaceVariant)
+                                    Text(if (vinylMode) "Vinyl & Spektrum" else "Sampul & Spektrum", Modifier.padding(horizontal = 10.dp, vertical = 6.dp), style = MaterialTheme.typography.labelSmall, fontWeight = FontWeight.Bold, color = if (!showFullKaraokeInPlayer) Color(0xFF101010) else MaterialTheme.colorScheme.onSurfaceVariant)
                                 }
                                 Surface(shape = RoundedCornerShape(16.dp), color = if (showFullKaraokeInPlayer) MaterialTheme.colorScheme.primary else Color.Transparent, modifier = Modifier.clickable { showFullKaraokeInPlayer = true }) {
-                                    Text(if (hasEnhancedKaraoke) "Karaoke LRC ★" else "Lirik Karaoke", Modifier.padding(horizontal = 12.dp, vertical = 6.dp), style = MaterialTheme.typography.labelMedium, fontWeight = FontWeight.Bold, color = if (showFullKaraokeInPlayer) Color(0xFF101010) else MaterialTheme.colorScheme.onSurfaceVariant)
+                                    Text(if (hasEnhancedKaraoke) "Karaoke LRC ★" else "Lirik Karaoke", Modifier.padding(horizontal = 10.dp, vertical = 6.dp), style = MaterialTheme.typography.labelSmall, fontWeight = FontWeight.Bold, color = if (showFullKaraokeInPlayer) Color(0xFF101010) else MaterialTheme.colorScheme.onSurfaceVariant)
                                 }
                             }
                             Row(verticalAlignment = Alignment.CenterVertically) {
+                                // Tombol Rekam Suara Karaoke
+                                Surface(
+                                    shape = RoundedCornerShape(12.dp),
+                                    color = if (isRecordingKaraoke) Color(0xFFD32F2F) else MaterialTheme.colorScheme.surfaceVariant,
+                                    modifier = Modifier.clickable { toggleKaraokeRecording() }
+                                ) {
+                                    Text(
+                                        if (isRecordingKaraoke) "■ Stop (${formatTime(recordingSeconds * 1000L)})" else "● Rec Mic",
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = if (isRecordingKaraoke) Color.White else MaterialTheme.colorScheme.primary,
+                                        fontWeight = FontWeight.Bold,
+                                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 5.dp)
+                                    )
+                                }
                                 TextButton(onClick = { showAudioLabDialog = true }) {
                                     val pitchLabel = if (pitchSemitones > 0) "+$pitchSemitones" else "$pitchSemitones"
-                                    Text("${playbackSpeed}x · Nada $pitchLabel", fontWeight = FontWeight.Bold, fontSize = 11.sp)
+                                    Text("${playbackSpeed}x·$pitchLabel", fontWeight = FontWeight.Bold, fontSize = 11.sp)
                                 }
                                 IconButton(onClick = { librarySubTab = LibrarySubTab.QUEUE; tab = LyraTab.LIBRARY }) { LyraVectorIcon(LyraIconType.QUEUE, tint = MaterialTheme.colorScheme.primary, size = 20.dp) }
                             }
                         }
                         Spacer(Modifier.height(4.dp))
                         if (!showFullKaraokeInPlayer) {
-                            Box(Modifier.fillMaxWidth().weight(0.38f).padding(horizontal = 12.dp, vertical = 4.dp).clip(RoundedCornerShape(28.dp)).background(Brush.linearGradient(listOf(Color(0xFF283A18), Color(0xFF151E0D), Color(0xFF0C1009)))).clickable { showFullKaraokeInPlayer = true }, contentAlignment = Alignment.Center) {
-                                if (currentTrack?.artworkUri != null) AsyncImage(model = currentTrack.artworkUri, contentDescription = null, modifier = Modifier.fillMaxSize(), contentScale = ContentScale.Crop)
-                                else Column(horizontalAlignment = Alignment.CenterHorizontally) { LyraBrandLogo(size = 100.dp, cornerRadius = 26.dp); Spacer(Modifier.height(8.dp)); Text(currentAlbum.ifBlank { "LYRA KARAOKE" }.uppercase(), color = Color(0xFFB8F36B), style = MaterialTheme.typography.labelMedium, fontWeight = FontWeight.Black) }
-                                Surface(color = Color.Black.copy(alpha = 0.55f), shape = RoundedCornerShape(14.dp), modifier = Modifier.align(Alignment.BottomEnd).padding(10.dp)) { Text("Ketuk untuk Lirik Karaoke ♪", color = Color.White, style = MaterialTheme.typography.labelSmall, modifier = Modifier.padding(horizontal = 10.dp, vertical = 5.dp)) }
+                            Box(
+                                Modifier.fillMaxWidth().weight(0.38f).padding(horizontal = 12.dp, vertical = 4.dp).clip(RoundedCornerShape(28.dp))
+                                    .background(Brush.linearGradient(listOf(dynamicDarkBg, Color(0xFF151E0D), Color(0xFF0C1009)))),
+                                contentAlignment = Alignment.Center
+                            ) {
+                                if (vinylMode) {
+                                    SpinningVinylStage(
+                                        artworkUri = currentTrack?.artworkUri,
+                                        albumTitle = currentAlbum,
+                                        isPlaying = playing,
+                                        accentColor = dynamicAccent,
+                                        onClick = { showFullKaraokeInPlayer = true },
+                                        modifier = Modifier.fillMaxSize()
+                                    )
+                                } else {
+                                    Box(Modifier.fillMaxSize().clickable { showFullKaraokeInPlayer = true }, contentAlignment = Alignment.Center) {
+                                        if (currentTrack?.artworkUri != null) AsyncImage(model = currentTrack.artworkUri, contentDescription = null, modifier = Modifier.fillMaxSize(), contentScale = ContentScale.Crop)
+                                        else Column(horizontalAlignment = Alignment.CenterHorizontally) { LyraBrandLogo(size = 100.dp, cornerRadius = 26.dp); Spacer(Modifier.height(8.dp)); Text(currentAlbum.ifBlank { "LYRA KARAOKE" }.uppercase(), color = dynamicAccent, style = MaterialTheme.typography.labelMedium, fontWeight = FontWeight.Black) }
+                                        Surface(color = Color.Black.copy(alpha = 0.55f), shape = RoundedCornerShape(14.dp), modifier = Modifier.align(Alignment.BottomEnd).padding(10.dp)) { Text("Ketuk untuk Lirik Karaoke ♪", color = Color.White, style = MaterialTheme.typography.labelSmall, modifier = Modifier.padding(horizontal = 10.dp, vertical = 5.dp)) }
+                                    }
+                                }
+                                Surface(
+                                    color = Color.Black.copy(alpha = 0.6f),
+                                    shape = RoundedCornerShape(12.dp),
+                                    modifier = Modifier.align(Alignment.TopStart).padding(10.dp).clickable {
+                                        vinylMode = !vinylMode; prefs.edit().putBoolean("vinyl_mode", vinylMode).apply()
+                                    }
+                                ) {
+                                    Text(if (vinylMode) "Mode: Piringan Vinyl ↻" else "Mode: Sampul Penuh ↻", color = Color.White, style = MaterialTheme.typography.labelSmall, modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp))
+                                }
                             }
-                            KaraokeMiniStage(parsedKaraokeLines, position, hasEnhancedKaraoke, autoWordKaraoke, { showFullKaraokeInPlayer = true }, { val (cT, cA) = cleanSearchQuery(currentTitle, currentArtist); searchTrack = cT; searchArtist = cA; lyricsSubTab = LyricsSubTab.SEARCH; tab = LyraTab.LYRICS; triggerManualLyricsSearch(cT, cA) })
+                            KaraokeMiniStage(parsedKaraokeLines, position, hasEnhancedKaraoke, autoWordKaraoke, dynamicAccent, { showFullKaraokeInPlayer = true }, { val (cT, cA) = cleanSearchQuery(currentTitle, currentArtist); searchTrack = cT; searchArtist = cA; lyricsSubTab = LyricsSubTab.SEARCH; tab = LyraTab.LYRICS; triggerManualLyricsSearch(cT, cA) })
                         } else {
-                            KaraokeFullStage(parsedKaraokeLines, position, hasEnhancedKaraoke, autoWordKaraoke, { autoWordKaraoke = !autoWordKaraoke; prefs.edit().putBoolean("auto_word_karaoke", autoWordKaraoke).apply() }, { ms -> controller?.seekTo(ms); position = ms }, { val (cT, cA) = cleanSearchQuery(currentTitle, currentArtist); searchTrack = cT; searchArtist = cA; lyricsSubTab = LyricsSubTab.SEARCH; tab = LyraTab.LYRICS; triggerManualLyricsSearch(cT, cA) }, Modifier.fillMaxWidth().weight(0.50f))
+                            KaraokeFullStage(
+                                lines = parsedKaraokeLines,
+                                positionMs = position,
+                                hasEnhancedTag = hasEnhancedKaraoke,
+                                autoWordKaraoke = autoWordKaraoke,
+                                accentColor = dynamicAccent,
+                                darkBgColor = dynamicDarkBg,
+                                onToggleAutoWord = { autoWordKaraoke = !autoWordKaraoke; prefs.edit().putBoolean("auto_word_karaoke", autoWordKaraoke).apply() },
+                                onShareClick = { showShareQuoteDialog = true },
+                                onSeekTo = { ms -> controller?.seekTo(ms); position = ms },
+                                onEditLyricsClick = { val (cT, cA) = cleanSearchQuery(currentTitle, currentArtist); searchTrack = cT; searchArtist = cA; lyricsSubTab = LyricsSubTab.SEARCH; tab = LyraTab.LYRICS; triggerManualLyricsSearch(cT, cA) },
+                                modifier = Modifier.fillMaxWidth().weight(0.50f)
+                            )
                         }
                         Spacer(Modifier.height(6.dp))
                         Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
@@ -1276,6 +1664,7 @@ private fun LyraApp() {
                             audioSessionId = audioSessionId,
                             isPlaying = playing,
                             style = visualizerStyle,
+                            accentColor = dynamicAccent,
                             onCycleStyle = {
                                 val all = VisualizerStyle.values()
                                 val next = all[(all.indexOf(visualizerStyle) + 1) % all.size]
@@ -1289,7 +1678,7 @@ private fun LyraApp() {
                                 Box(contentAlignment = Alignment.Center) { LyraVectorIcon(LyraIconType.SHUFFLE, tint = if (shuffle) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant, size = 22.dp) }
                             }
                             FilledTonalButton(onClick = { controller?.seekToPreviousMediaItem() }, modifier = Modifier.size(52.dp), shape = RoundedCornerShape(16.dp), contentPadding = PaddingValues(0.dp)) { LyraVectorIcon(LyraIconType.PREV, tint = Color.White, size = 22.dp) }
-                            Button(onClick = { if (playing) controller?.pause() else if (currentUri != null) controller?.play() else if (sortedAndFilteredSongs.isNotEmpty()) playTracks(sortedAndFilteredSongs, 0) }, modifier = Modifier.size(66.dp), shape = RoundedCornerShape(22.dp), contentPadding = PaddingValues(0.dp)) { LyraVectorIcon(if (playing) LyraIconType.PAUSE else LyraIconType.PLAY, tint = Color(0xFF0B0D0A), size = 28.dp) }
+                            Button(onClick = { if (currentUri != null || playing) togglePlayWithFade() else if (sortedAndFilteredSongs.isNotEmpty()) playTracks(sortedAndFilteredSongs, 0) }, modifier = Modifier.size(66.dp), shape = RoundedCornerShape(22.dp), contentPadding = PaddingValues(0.dp)) { LyraVectorIcon(if (playing) LyraIconType.PAUSE else LyraIconType.PLAY, tint = Color(0xFF0B0D0A), size = 28.dp) }
                             FilledTonalButton(onClick = { controller?.seekToNextMediaItem() }, modifier = Modifier.size(52.dp), shape = RoundedCornerShape(16.dp), contentPadding = PaddingValues(0.dp)) { LyraVectorIcon(LyraIconType.NEXT, tint = Color.White, size = 22.dp) }
                             Surface(shape = CircleShape, color = if (repeatMode != Player.REPEAT_MODE_OFF) MaterialTheme.colorScheme.primary.copy(alpha = 0.2f) else Color.Transparent, modifier = Modifier.size(44.dp).clickable { val nx = when (repeatMode) { Player.REPEAT_MODE_OFF -> Player.REPEAT_MODE_ALL; Player.REPEAT_MODE_ALL -> Player.REPEAT_MODE_ONE; else -> Player.REPEAT_MODE_OFF }; controller?.repeatMode = nx; repeatMode = nx }) {
                                 Box(contentAlignment = Alignment.Center) { LyraVectorIcon(when (repeatMode) { Player.REPEAT_MODE_ONE -> LyraIconType.REPEAT_ONE; Player.REPEAT_MODE_ALL -> LyraIconType.REPEAT_ALL; else -> LyraIconType.REPEAT_OFF }, tint = if (repeatMode != Player.REPEAT_MODE_OFF) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant, size = 22.dp) }
@@ -1299,7 +1688,7 @@ private fun LyraApp() {
 
                     LyraTab.LIBRARY -> {
                         Spacer(Modifier.height(8.dp))
-                        Row(Modifier.fillMaxWidth().clip(RoundedCornerShape(18.dp)).background(MaterialTheme.colorScheme.surfaceVariant).padding(4.dp), horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                        Row(Modifier.fillMaxWidth().clip(RoundedCornerShape(18.dp)).background(MaterialTheme.colorScheme.surfaceVariant).padding(4.dp), horizontalArrangement = Arrangement.spacedBy(3.dp)) {
                             LibrarySubTab.values().forEach { sub ->
                                 val active = librarySubTab == sub
                                 Surface(shape = RoundedCornerShape(14.dp), color = if (active) MaterialTheme.colorScheme.primary else Color.Transparent, modifier = Modifier.weight(1f).clickable { librarySubTab = sub }) {
@@ -1321,35 +1710,74 @@ private fun LyraApp() {
                                 }
                                 TrackList(listToShow, currentUri, playing, favoriteIds, ::playTracks, ::toggleFavorite, { trackToAdd = it }, { openMetadataEditor(it) }, true, Modifier.weight(1f))
                             }
+                            LibrarySubTab.FOLDERS -> {
+                                Spacer(Modifier.height(8.dp))
+                                val activeFolder = selectedBrowseFolder
+                                if (activeFolder != null) {
+                                    val folderTracks = durationFilteredSongs.filter { (it.folder.ifBlank { "Penyimpanan Internal" }) == activeFolder }
+                                    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.SpaceBetween, modifier = Modifier.fillMaxWidth()) {
+                                        TextButton(onClick = { selectedBrowseFolder = null }) { Text("← Semua Folder") }
+                                        Button(onClick = { if (folderTracks.isNotEmpty()) playTracks(folderTracks, 0) }) { Text("▶ Putar Folder (${folderTracks.size})") }
+                                    }
+                                    Text(activeFolder.substringAfterLast('/'), style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
+                                    Text(activeFolder, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.padding(bottom = 6.dp))
+                                    TrackList(folderTracks, currentUri, playing, favoriteIds, ::playTracks, ::toggleFavorite, { trackToAdd = it }, { openMetadataEditor(it) }, false, Modifier.weight(1f))
+                                } else {
+                                    Text("Penjelajah Folder Musik (${folderGroups.size} Folder)", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold, modifier = Modifier.padding(bottom = 6.dp))
+                                    LazyColumn(verticalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.weight(1f)) {
+                                        items(folderGroups, key = { it.key }) { (folderPath, list) ->
+                                            ElevatedCard(onClick = { selectedBrowseFolder = folderPath }) {
+                                                Row(Modifier.fillMaxWidth().padding(14.dp), verticalAlignment = Alignment.CenterVertically) {
+                                                    LyraBrandLogo(size = 42.dp, cornerRadius = 12.dp)
+                                                    Column(Modifier.weight(1f).padding(horizontal = 12.dp)) {
+                                                        Text(folderPath.substringAfterLast('/').ifBlank { folderPath }, fontWeight = FontWeight.Bold, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                                                        Text("${list.size} lagu · $folderPath", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                                                    }
+                                                    FilledTonalIconButton(onClick = { playTracks(list, 0) }) { LyraVectorIcon(LyraIconType.PLAY, tint = MaterialTheme.colorScheme.primary, size = 18.dp) }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
                             LibrarySubTab.PLAYLISTS -> {
                                 Spacer(Modifier.height(8.dp))
-                                Row(verticalAlignment = Alignment.CenterVertically) { Text("Koleksi Playlist", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold, modifier = Modifier.weight(1f)); Button(onClick = { showCreatePlaylist = true }) { Text("+ Buat Playlist") } }
+                                Row(verticalAlignment = Alignment.CenterVertically) { Text("Smart & Custom Playlist", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold, modifier = Modifier.weight(1f)); Button(onClick = { showCreatePlaylist = true }) { Text("+ Buat Playlist") } }
                                 Spacer(Modifier.height(8.dp))
                                 if (selectedPlaylist != null) {
+                                    val isSmart = selectedPlaylist in setOf("Favorit", "Top 25 Sering Diputar", "Baru Ditambahkan", "Belum Pernah Diputar")
                                     TextButton(onClick = { selectedPlaylist = null }) { Text("← Kembali ke daftar playlist") }
                                     Text(selectedPlaylist.orEmpty(), style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
                                     Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.padding(vertical = 6.dp)) {
                                         Button(onClick = { playTracks(playlistTracks, 0) }, enabled = playlistTracks.isNotEmpty()) { Text("▶ Putar") }
-                                        OutlinedButton(onClick = { val p = playlists.firstOrNull { it.name == selectedPlaylist }; if (p != null) { val allIds = durationFilteredSongs.map { s -> s.id }; playlists = playlists.map { item -> if (item.name == p.name) item.copy(trackIds = (item.trackIds + allIds).distinct()) else item }; savePlaylists() } }) { Text("+ Semua Lagu") }
-                                        OutlinedButton(onClick = { playlists = playlists.filterNot { it.name == selectedPlaylist }; savePlaylists(); selectedPlaylist = null }) { Text("Hapus") }
+                                        if (!isSmart) {
+                                            OutlinedButton(onClick = { val p = playlists.firstOrNull { it.name == selectedPlaylist }; if (p != null) { val allIds = durationFilteredSongs.map { s -> s.id }; playlists = playlists.map { item -> if (item.name == p.name) item.copy(trackIds = (item.trackIds + allIds).distinct()) else item }; savePlaylists() } }) { Text("+ Semua Lagu") }
+                                            OutlinedButton(onClick = { playlists = playlists.filterNot { it.name == selectedPlaylist }; savePlaylists(); selectedPlaylist = null }) { Text("Hapus") }
+                                        }
                                     }
                                     TrackList(playlistTracks, currentUri, playing, favoriteIds, ::playTracks, ::toggleFavorite, { trackToAdd = it }, { openMetadataEditor(it) }, false, Modifier.weight(1f))
                                 } else {
+                                    val smartEntries = listOf(
+                                        Triple("Favorit", "Lagu yang Anda sukai", favoriteTracks),
+                                        Triple("Top 25 Sering Diputar", "Paling sering Anda dengarkan", topPlayedTracks),
+                                        Triple("Baru Ditambahkan", "30 lagu terbaru di perangkat", recentlyAddedTracks),
+                                        Triple("Belum Pernah Diputar", "Koleksi yang belum tersentuh", neverPlayedTracks)
+                                    )
                                     LazyColumn(verticalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.weight(1f)) {
-                                        item {
-                                            ElevatedCard(onClick = { selectedPlaylist = "Favorit" }) {
-                                                Row(Modifier.fillMaxWidth().padding(16.dp), verticalAlignment = Alignment.CenterVertically) {
-                                                    LyraVectorIcon(LyraIconType.HEART_FILLED, tint = MaterialTheme.colorScheme.primary, size = 26.dp)
-                                                    Column(Modifier.weight(1f).padding(start = 12.dp)) { Text("Lagu Favorit", fontWeight = FontWeight.Bold); Text("${favoriteTracks.size} lagu", style = MaterialTheme.typography.bodySmall) }
-                                                    FilledTonalIconButton(onClick = { playTracks(favoriteTracks, 0) }, enabled = favoriteTracks.isNotEmpty()) { LyraVectorIcon(LyraIconType.PLAY, tint = MaterialTheme.colorScheme.primary, size = 18.dp) }
+                                        items(smartEntries) { (name, desc, list) ->
+                                            ElevatedCard(onClick = { selectedPlaylist = name }) {
+                                                Row(Modifier.fillMaxWidth().padding(14.dp), verticalAlignment = Alignment.CenterVertically) {
+                                                    LyraVectorIcon(if (name == "Favorit") LyraIconType.HEART_FILLED else LyraIconType.MUSIC, tint = MaterialTheme.colorScheme.primary, size = 24.dp)
+                                                    Column(Modifier.weight(1f).padding(start = 12.dp)) { Text(name, fontWeight = FontWeight.Bold); Text("$desc · ${list.size} lagu", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant) }
+                                                    FilledTonalIconButton(onClick = { playTracks(list, 0) }, enabled = list.isNotEmpty()) { LyraVectorIcon(LyraIconType.PLAY, tint = MaterialTheme.colorScheme.primary, size = 18.dp) }
                                                 }
                                             }
                                         }
                                         items(playlists, key = { it.name }) { p ->
                                             ElevatedCard(onClick = { selectedPlaylist = p.name }) {
-                                                Row(Modifier.fillMaxWidth().padding(16.dp), verticalAlignment = Alignment.CenterVertically) {
-                                                    LyraVectorIcon(LyraIconType.MUSIC, tint = MaterialTheme.colorScheme.primary, size = 26.dp)
-                                                    Column(Modifier.weight(1f).padding(start = 12.dp)) { Text(p.name, fontWeight = FontWeight.Bold); Text("${p.trackIds.size} lagu", style = MaterialTheme.typography.bodySmall) }
+                                                Row(Modifier.fillMaxWidth().padding(14.dp), verticalAlignment = Alignment.CenterVertically) {
+                                                    LyraVectorIcon(LyraIconType.QUEUE, tint = MaterialTheme.colorScheme.primary, size = 24.dp)
+                                                    Column(Modifier.weight(1f).padding(start = 12.dp)) { Text(p.name, fontWeight = FontWeight.Bold); Text("Playlist Kustom · ${p.trackIds.size} lagu", style = MaterialTheme.typography.bodySmall) }
                                                     FilledTonalIconButton(onClick = { playTracks(p.trackIds.mapNotNull { id -> songs.firstOrNull { it.id == id } }, 0) }) { LyraVectorIcon(LyraIconType.PLAY, tint = MaterialTheme.colorScheme.primary, size = 18.dp) }
                                                 }
                                             }
@@ -1359,17 +1787,19 @@ private fun LyraApp() {
                             }
                             LibrarySubTab.QUEUE -> {
                                 Spacer(Modifier.height(8.dp))
-                                Text("Antrean Pemutaran Saat Ini", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
+                                Text("Antrean Pemutaran Interaktif", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
                                 val queue = controller?.let { c -> (0 until c.mediaItemCount).mapNotNull { i -> val item = c.getMediaItemAt(i); val uri = item.localConfiguration?.uri ?: return@mapNotNull null; val matched = songs.firstOrNull { it.id == item.mediaId || it.uri == uri }; applyTrackOverride(AudioTrack(item.mediaId.ifBlank { uri.toString() }, uri, item.mediaMetadata.title?.toString() ?: "Audio", item.mediaMetadata.artist?.toString() ?: "Artis", item.mediaMetadata.albumTitle?.toString() ?: "", 0L, filePath = matched?.filePath.orEmpty())) } }.orEmpty()
                                 if (queue.isEmpty()) EmptyState("Antrean kosong", "Pilih lagu untuk mulai memutar.")
                                 else LazyColumn(Modifier.weight(1f)) {
                                     items(queue.indices.toList(), key = { queue[it].id + "_$it" }) { idx ->
                                         val tr = queue[idx]; val isCur = tr.uri == currentUri
-                                        Row(Modifier.fillMaxWidth().clickable { controller?.seekTo(idx, 0L); controller?.play() }.padding(vertical = 10.dp), verticalAlignment = Alignment.CenterVertically) {
-                                            Text(if (isCur) "▶" else "${idx + 1}", Modifier.width(32.dp), color = if (isCur) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurface)
+                                        Row(Modifier.fillMaxWidth().clickable { controller?.seekTo(idx, 0L); controller?.play() }.padding(vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) {
+                                            Text(if (isCur) "▶" else "${idx + 1}", Modifier.width(28.dp), color = if (isCur) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurface)
                                             Column(Modifier.weight(1f)) { Text(tr.title, maxLines = 1, overflow = TextOverflow.Ellipsis, fontWeight = if (isCur) FontWeight.Bold else FontWeight.Normal); Text(tr.artist, style = MaterialTheme.typography.bodySmall) }
-                                            IconButton(onClick = { openMetadataEditor(tr) }) { LyraVectorIcon(LyraIconType.EDIT, size = 18.dp) }
-                                            TextButton(onClick = { controller?.removeMediaItem(idx) }) { Text("Hapus") }
+                                            if (idx > 0) TextButton(onClick = { controller?.moveMediaItem(idx, idx - 1) }, contentPadding = PaddingValues(0.dp), modifier = Modifier.width(30.dp)) { Text("↑") }
+                                            if (idx < queue.lastIndex) TextButton(onClick = { controller?.moveMediaItem(idx, idx + 1) }, contentPadding = PaddingValues(0.dp), modifier = Modifier.width(30.dp)) { Text("↓") }
+                                            IconButton(onClick = { openMetadataEditor(tr) }, modifier = Modifier.size(32.dp)) { LyraVectorIcon(LyraIconType.EDIT, size = 16.dp) }
+                                            TextButton(onClick = { controller?.removeMediaItem(idx) }, contentPadding = PaddingValues(horizontal = 6.dp)) { Text("✕") }
                                         }
                                         HorizontalDivider()
                                     }
@@ -1402,7 +1832,19 @@ private fun LyraApp() {
                         Spacer(Modifier.height(8.dp))
                         when (lyricsSubTab) {
                             LyricsSubTab.PREVIEW -> {
-                                KaraokeFullStage(parsedKaraokeLines, position, hasEnhancedKaraoke, autoWordKaraoke, { autoWordKaraoke = !autoWordKaraoke; prefs.edit().putBoolean("auto_word_karaoke", autoWordKaraoke).apply() }, { ms -> controller?.seekTo(ms); position = ms }, { val (cT, cA) = cleanSearchQuery(currentTitle, currentArtist); searchTrack = cT; searchArtist = cA; lyricsSubTab = LyricsSubTab.SEARCH; triggerManualLyricsSearch(cT, cA) }, Modifier.fillMaxWidth().weight(1f))
+                                KaraokeFullStage(
+                                    lines = parsedKaraokeLines,
+                                    positionMs = position,
+                                    hasEnhancedTag = hasEnhancedKaraoke,
+                                    autoWordKaraoke = autoWordKaraoke,
+                                    accentColor = dynamicAccent,
+                                    darkBgColor = dynamicDarkBg,
+                                    onToggleAutoWord = { autoWordKaraoke = !autoWordKaraoke; prefs.edit().putBoolean("auto_word_karaoke", autoWordKaraoke).apply() },
+                                    onShareClick = { showShareQuoteDialog = true },
+                                    onSeekTo = { ms -> controller?.seekTo(ms); position = ms },
+                                    onEditLyricsClick = { val (cT, cA) = cleanSearchQuery(currentTitle, currentArtist); searchTrack = cT; searchArtist = cA; lyricsSubTab = LyricsSubTab.SEARCH; triggerManualLyricsSearch(cT, cA) },
+                                    modifier = Modifier.fillMaxWidth().weight(1f)
+                                )
                                 Spacer(Modifier.height(8.dp))
                                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth().padding(bottom = 6.dp)) {
                                     OutlinedButton(onClick = { lrcText = EnhancedLrcEngine.shiftAllTags(lrcText, -500); saveLrcToCache(lrcText) }, modifier = Modifier.weight(1f)) { Text("−0,5 dtk") }
@@ -1436,7 +1878,7 @@ private fun LyraApp() {
                                                 Column(Modifier.fillMaxWidth().padding(14.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
                                                     Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.SpaceBetween, modifier = Modifier.fillMaxWidth()) {
                                                         Text(nameStr, fontWeight = FontWeight.ExtraBold, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f))
-                                                        Surface(shape = RoundedCornerShape(10.dp), color = when { isEnhanced -> Color(0xFFB8F36B); isSynced -> Color(0xFF3A5A20); else -> Color(0xFF3A3A3A) }) {
+                                                        Surface(shape = RoundedCornerShape(10.dp), color = when { isEnhanced -> dynamicAccent; isSynced -> Color(0xFF3A5A20); else -> Color(0xFF3A3A3A) }) {
                                                             Text(when { isEnhanced -> "KARAOKE LRC ★"; isSynced -> "SYNCED LRC"; else -> "TEKS BIASA" }, style = MaterialTheme.typography.labelSmall, fontWeight = FontWeight.Bold, color = if (isEnhanced) Color(0xFF101010) else Color.White, modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp))
                                                         }
                                                     }
@@ -1453,7 +1895,7 @@ private fun LyraApp() {
                                     Column(Modifier.padding(10.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
                                         Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.SpaceBetween, modifier = Modifier.fillMaxWidth()) {
                                             Text("Waktu Lagu: ${formatTime(position)}", style = MaterialTheme.typography.labelMedium, fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.primary)
-                                            Text("Format: [mm:ss.xx]<mm:ss.xx>Kata", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                            Text("Terjemahan: gunakan ' // ' di akhir baris", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                                         }
                                         Row(horizontalArrangement = Arrangement.spacedBy(6.dp), modifier = Modifier.fillMaxWidth()) {
                                             FilledTonalButton(onClick = { lrcText = (lrcText.trimEnd() + "\n" + EnhancedLrcEngine.formatLineTag(position) + " ").trimStart() }, modifier = Modifier.weight(1f), contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp)) { Text("+ [Baris] ${EnhancedLrcEngine.formatLineTag(position)}", fontSize = 11.sp) }
@@ -1462,7 +1904,7 @@ private fun LyraApp() {
                                     }
                                 }
                                 Spacer(Modifier.height(6.dp))
-                                OutlinedTextField(value = lrcText, onValueChange = { lrcText = it }, modifier = Modifier.weight(1f).fillMaxWidth(), shape = RoundedCornerShape(16.dp), label = { Text("Editor Teks .LRC / Enhanced LRC") })
+                                OutlinedTextField(value = lrcText, onValueChange = { lrcText = it }, modifier = Modifier.weight(1f).fillMaxWidth(), shape = RoundedCornerShape(16.dp), label = { Text("Editor Teks .LRC / Enhanced LRC / Dual Terjemahan") })
                                 Spacer(Modifier.height(6.dp))
                                 Row(horizontalArrangement = Arrangement.spacedBy(6.dp), modifier = Modifier.fillMaxWidth().padding(bottom = 6.dp)) {
                                     OutlinedButton(onClick = { saveLrcLauncher.launch(currentTitle.substringBeforeLast('.', currentTitle) + ".lrc") }, Modifier.weight(1f)) { Text("Ekspor") }
@@ -1476,10 +1918,25 @@ private fun LyraApp() {
                     LyraTab.SETTINGS -> {
                         LazyColumn(verticalArrangement = Arrangement.spacedBy(10.dp), contentPadding = PaddingValues(vertical = 10.dp)) {
                             item {
-                                Text("Pengaturan", style = MaterialTheme.typography.headlineMedium, fontWeight = FontWeight.Bold)
+                                Text("Pengaturan & Personalisasi", style = MaterialTheme.typography.headlineMedium, fontWeight = FontWeight.Bold)
                                 SettingRow("Tema gelap", "Gunakan antarmuka gelap khas Lyra", darkMode) { darkMode = it; prefs.edit().putBoolean("dark_mode", it).apply() }
-                                SettingRow("Lirik otomatis", "Cari lirik otomatis saat lagu diputar", autoLyrics) { autoLyrics = it; prefs.edit().putBoolean("auto_lyrics", it).apply() }
+                                SettingRow("Mode Piringan Hitam (Vinyl)", "Tampilkan animasi piringan hitam berputar & tonearm di layar putar", vinylMode) { vinylMode = it; prefs.edit().putBoolean("vinyl_mode", it).apply() }
+                                SettingRow("Smooth Fade-Out", "Turunkan volume secara halus saat jeda & timer tidur", smoothFadePause) { smoothFadePause = it; prefs.edit().putBoolean("smooth_fade", it).apply() }
+                                SettingRow("Bluetooth Car / Watch Live Lyrics", "Kirim baris lirik aktif ke layar mobil atau smartwatch via metadata AVRCP", bluetoothLiveLyrics) { bluetoothLiveLyrics = it; prefs.edit().putBoolean("bt_live_lyrics", it).apply() }
+                                SettingRow("Lirik otomatis", "Cari lirik otomatis dari folder lokal, cache, atau internet", autoLyrics) { autoLyrics = it; prefs.edit().putBoolean("auto_lyrics", it).apply() }
                                 SettingRow("Auto-Word Karaoke (Estimasi Kata)", "Sorot kata demi kata otomatis untuk LRC biasa yang belum memiliki tag <mm:ss.xx>", autoWordKaraoke) { autoWordKaraoke = it; prefs.edit().putBoolean("auto_word_karaoke", it).apply() }
+                            }
+                            item {
+                                ElevatedCard(Modifier.fillMaxWidth(), shape = RoundedCornerShape(20.dp)) {
+                                    Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                                        Text("Tema Warna Aksen & Lirik", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
+                                        Row(Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                            ThemeAccent.values().forEach { preset ->
+                                                FilterChip(selected = themePreset == preset, onClick = { themePreset = preset; prefs.edit().putString("theme_preset", preset.name).apply() }, label = { Text(preset.label) })
+                                            }
+                                        }
+                                    }
+                                }
                             }
                             item {
                                 ElevatedCard(Modifier.fillMaxWidth(), shape = RoundedCornerShape(20.dp)) {
@@ -1494,7 +1951,7 @@ private fun LyraApp() {
                             }
                             item {
                                 ElevatedCard(Modifier.fillMaxWidth(), shape = RoundedCornerShape(20.dp)) {
-                                    Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) { Text("Audio & Equalizer", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold); EqualizerPanel(audioSessionId = audioSessionId) }
+                                    Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) { Text("Audio, 3D Surround & Equalizer", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold); EqualizerPanel(audioSessionId = audioSessionId) }
                                 }
                             }
                             item {
@@ -1512,6 +1969,39 @@ private fun LyraApp() {
                 }
             }
         }
+    }
+
+    if (showShareQuoteDialog) {
+        val activeIdx = parsedKaraokeLines.indexOfLast { it.startMs <= position }.coerceAtLeast(0)
+        val quoteSnippet = parsedKaraokeLines.drop((activeIdx - 1).coerceAtLeast(0)).take(3).joinToString("\n") {
+            if (it.translationText.isNotBlank()) "“${it.plainText}”\n(${it.translationText})" else "“${it.plainText}”"
+        }.ifBlank { "“$currentLyric”" }
+        AlertDialog(
+            onDismissRequest = { showShareQuoteDialog = false },
+            title = { Text("Bagikan Kutipan Lirik") },
+            text = {
+                ElevatedCard(shape = RoundedCornerShape(20.dp), colors = CardDefaults.elevatedCardColors(containerColor = dynamicDarkBg)) {
+                    Column(Modifier.fillMaxWidth().padding(18.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Text("♫ LYRA KARAOKE CARD", style = MaterialTheme.typography.labelSmall, color = dynamicAccent, fontWeight = FontWeight.Black)
+                        Text(quoteSnippet, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.ExtraBold, color = Color.White)
+                        HorizontalDivider(color = Color.White.copy(alpha = 0.15f))
+                        Text("$currentTitle — ${currentArtist.ifBlank { "Lyra Player" }}", style = MaterialTheme.typography.bodySmall, color = dynamicAccent)
+                    }
+                }
+            },
+            confirmButton = {
+                Button(onClick = {
+                    val shareText = "$quoteSnippet\n\n— $currentTitle ($currentArtist)\nDiputar di Lyra Karaoke Player ♫"
+                    val sendIntent = Intent(Intent.ACTION_SEND).apply {
+                        type = "text/plain"
+                        putExtra(Intent.EXTRA_TEXT, shareText)
+                    }
+                    runCatching { context.startActivity(Intent.createChooser(sendIntent, "Bagikan Kutipan Lirik")) }
+                    showShareQuoteDialog = false
+                }) { Text("Bagikan Sekarang") }
+            },
+            dismissButton = { TextButton(onClick = { showShareQuoteDialog = false }) { Text("Tutup") } }
+        )
     }
 
     if (showAudioLabDialog) {
