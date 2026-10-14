@@ -29,7 +29,6 @@ import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -136,14 +135,6 @@ private fun LyraApp() {
     var editTitle by remember { mutableStateOf("") }
     var editArtist by remember { mutableStateOf("") }
     var editAlbum by remember { mutableStateOf("") }
-    var editGenre by remember { mutableStateOf("") }
-    var editYear by remember { mutableStateOf("") }
-    var editTrackNumber by remember { mutableStateOf("") }
-    var editComposer by remember { mutableStateOf("") }
-    var editArtworkUri by remember { mutableStateOf<Uri?>(null) }
-    var wordSyncLineIndex by remember { mutableIntStateOf(-1) }
-    var wordSyncWords by remember { mutableStateOf<List<String>>(emptyList()) }
-    var wordSyncEntries by remember { mutableStateOf<List<Pair<Long, String>>>(emptyList()) }
     var selectedLyricLine by remember { mutableIntStateOf(-1) }
     var editedLyricLine by remember { mutableStateOf("") }
 
@@ -231,16 +222,6 @@ private fun LyraApp() {
             prefs.edit().putString("current_lrc", lrcText).putString("current_lrc_key", lyricsCacheKey(currentTitle, currentArtist)).apply()
             status = "Berkas LRC berhasil dibuka."
         } catch (e: Exception) { status = "Gagal membuka LRC: ${e.message}" }
-    }
-    val artworkPicker = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { uri ->
-        if (uri != null) { editArtworkUri = uri; status = "Sampul dipilih. Simpan metadata untuk menyematkannya ke file audio." }
-    }
-    val tagFilePicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
-        if (uri != null) {
-            runCatching { context.contentResolver.takePersistableUriPermission(uri, android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION or android.content.Intent.FLAG_GRANT_WRITE_URI_PERMISSION) }
-            currentUri = uri
-            status = "File audio tujuan metadata dipilih. Pastikan file dapat ditulis."
-        }
     }
     val saveLrcLauncher = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("text/plain")) { uri ->
         if (uri != null) try {
@@ -590,7 +571,7 @@ private fun LyraApp() {
                                 Text(currentAlbum.ifBlank { "Album tidak diketahui" }, style = MaterialTheme.typography.bodySmall)
                             }
                             IconButton(onClick = { currentTrack?.let { toggleFavorite(it) } }) { Text(if (currentTrack?.id?.let { it in favoriteIds } == true) "♥" else "♡", style = MaterialTheme.typography.headlineSmall) }
-                            IconButton(onClick = { editTitle = currentTitle; editArtist = currentArtist; editAlbum = currentAlbum; editGenre = ""; editYear = ""; editTrackNumber = ""; editComposer = ""; editArtworkUri = null; showMetadataDialog = true }) { Text("✎", style = MaterialTheme.typography.titleLarge) }
+                            IconButton(onClick = { editTitle = currentTitle; editArtist = currentArtist; editAlbum = currentAlbum; showMetadataDialog = true }) { Text("✎", style = MaterialTheme.typography.titleLarge) }
                         }
                         if (duration > 0) {
                             Slider(value = position.coerceIn(0L, duration).toFloat(), onValueChange = { position = it.toLong() }, onValueChangeFinished = { controller?.seekTo(position) }, valueRange = 0f..duration.toFloat())
@@ -772,11 +753,6 @@ private fun LyraApp() {
                                     Text(lyricLine.takeWhile { it != ']' }.removePrefix("[").ifBlank { "teks" }, Modifier.width(66.dp), style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.secondary)
                                     Text(lyricLine.substringAfterLast("]").ifBlank { lyricLine }, Modifier.weight(1f), maxLines = 2, overflow = TextOverflow.Ellipsis, style = MaterialTheme.typography.bodySmall)
                                     TextButton(onClick = { selectedLyricLine = lineIndex; editedLyricLine = lyricLine.substringAfterLast("]"); if (!lyricLine.contains("]")) editedLyricLine = lyricLine }) { Text("Edit") }
-                                    TextButton(onClick = {
-                                        wordSyncLineIndex = lineIndex
-                                        wordSyncWords = lyricLine.substringAfterLast("]").replace(Regex("<[^>]+>"), "").trim().split(Regex("\\s+")).filter { it.isNotBlank() }
-                                        wordSyncEntries = emptyList()
-                                    }) { Text("Kata") }
                                 }
                             }
                         }
@@ -794,35 +770,6 @@ private fun LyraApp() {
                                     selectedLyricLine = -1
                                 }) { Text("Terapkan baris") }
                                 TextButton(onClick = { selectedLyricLine = -1 }) { Text("Batal") }
-                            }
-                        }
-                        if (wordSyncLineIndex >= 0) {
-                            ElevatedCard(Modifier.fillMaxWidth()) {
-                                Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                                    Text("Sinkronisasi karaoke per kata", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
-                                    Text("Putar lagu dan tekan cap setiap kali kata berikutnya terdengar. ${wordSyncEntries.size}/${wordSyncWords.size} kata tersinkron.", style = MaterialTheme.typography.bodySmall)
-                                    Text(wordSyncWords.getOrNull(wordSyncEntries.size).orEmpty().ifBlank { "Semua kata selesai" }, style = MaterialTheme.typography.headlineSmall, color = MaterialTheme.colorScheme.primary)
-                                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                                        Button(enabled = wordSyncEntries.size < wordSyncWords.size, onClick = {
-                                            wordSyncEntries = wordSyncEntries + (position to wordSyncWords[wordSyncEntries.size])
-                                        }) { Text("Cap kata @ ${formatTime(position)}") }
-                                        TextButton(onClick = { wordSyncLineIndex = -1; wordSyncWords = emptyList(); wordSyncEntries = emptyList() }) { Text("Batal") }
-                                    }
-                                    Button(enabled = wordSyncEntries.size == wordSyncWords.size && wordSyncWords.isNotEmpty(), onClick = {
-                                        val all = lrcText.lines().toMutableList()
-                                        if (wordSyncLineIndex in all.indices) {
-                                            val original = all[wordSyncLineIndex]
-                                            val prefix = Regex("^(?:\\[[0-9]{2,3}:[0-9]{2}(?:[.:][0-9]{1,3})?])+").find(original)?.value.orEmpty()
-                                                .ifBlank { LrcParser.timestamp(wordSyncEntries.firstOrNull()?.first ?: position) }
-                                            val enhanced = wordSyncEntries.joinToString(" ") { (ms, word) ->
-                                                val safe = ms.coerceAtLeast(0L); "<%02d:%02d.%02d>%s".format(Locale.ROOT, safe / 60000, (safe / 1000) % 60, (safe % 1000) / 10, word)
-                                            }
-                                            all[wordSyncLineIndex] = "$prefix $enhanced"
-                                            lrcText = all.joinToString("\n")
-                                        }
-                                        wordSyncLineIndex = -1; wordSyncWords = emptyList(); wordSyncEntries = emptyList()
-                                    }, modifier = Modifier.fillMaxWidth()) { Text("Terapkan cap waktu kata") }
-                                }
                             }
                         }
                         Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
@@ -938,21 +885,13 @@ private fun LyraApp() {
     if (showMetadataDialog) {
         AlertDialog(
             onDismissRequest = { showMetadataDialog = false },
-            title = { Text("Edit metadata lagu") },
+            title = { Text("Edit keterangan lagu") },
             text = {
-                Column(Modifier.heightIn(max = 520.dp).verticalScroll(androidx.compose.foundation.rememberScrollState()), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                    Text("Simpan perubahan ke tag file audio. Jika Android menolak penulisan, pilih file audio asli dengan tombol Pilih file.", style = MaterialTheme.typography.bodySmall)
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text("Perubahan diterapkan ke tampilan dan sesi pemutar Lyra. Penulisan tag judul/artis/album ke file audio belum tersedia; gunakan pengelola tag eksternal untuk itu.", style = MaterialTheme.typography.bodySmall)
                     OutlinedTextField(editTitle, { editTitle = it }, label = { Text("Judul lagu") }, singleLine = true)
                     OutlinedTextField(editArtist, { editArtist = it }, label = { Text("Artis") }, singleLine = true)
                     OutlinedTextField(editAlbum, { editAlbum = it }, label = { Text("Album") }, singleLine = true)
-                    OutlinedTextField(editGenre, { editGenre = it }, label = { Text("Genre") }, singleLine = true)
-                    OutlinedTextField(editYear, { editYear = it.filter(Char::isDigit).take(4) }, label = { Text("Tahun") }, singleLine = true)
-                    OutlinedTextField(editTrackNumber, { editTrackNumber = it.filter(Char::isDigit).take(3) }, label = { Text("Nomor trek") }, singleLine = true)
-                    OutlinedTextField(editComposer, { editComposer = it }, label = { Text("Komposer") }, singleLine = true)
-                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        OutlinedButton(onClick = { artworkPicker.launch("image/*") }) { Text(if (editArtworkUri == null) "Pilih sampul" else "Ganti sampul") }
-                        OutlinedButton(onClick = { tagFilePicker.launch(arrayOf("audio/*")) }) { Text("Pilih file") }
-                    }
                 }
             },
             confirmButton = {
@@ -960,32 +899,19 @@ private fun LyraApp() {
                     val title = editTitle.trim().ifBlank { currentTitle }
                     val artist = editArtist.trim().ifBlank { "Artis tidak diketahui" }
                     val album = editAlbum.trim().ifBlank { "Album tidak diketahui" }
-                    val uri = currentUri
-                    scope.launch {
-                        val result = if (uri == null) Result.failure(IllegalStateException("Pilih atau putar file audio terlebih dahulu")) else runCatching {
-                            withContext(Dispatchers.IO) {
-                                AudioTagEditor.write(context, uri, AudioTagEditor.Metadata(
-                                    title = title, artist = artist, album = album, genre = editGenre,
-                                    year = editYear, track = editTrackNumber, composer = editComposer,
-                                    artworkUri = editArtworkUri
-                                ))
-                            }
-                        }
-                        currentTitle = title; currentArtist = artist; currentAlbum = album
-                        songs = songs.map { song -> if (song.uri == uri) song.copy(title = title, artist = artist, album = album, artworkUri = editArtworkUri ?: song.artworkUri) else song }
-                        prefs.edit().putString("current_title", title).putString("current_artist", artist).putString("current_album", album).apply()
-                        val c = controller
-                        val idx = c?.currentMediaItemIndex ?: -1
-                        if (c != null && idx >= 0 && idx < c.mediaItemCount) {
-                            val old = c.getMediaItemAt(idx)
-                            val updated = old.buildUpon().setMediaMetadata(old.mediaMetadata.buildUpon().setTitle(title).setArtist(artist).setAlbumTitle(album).setArtworkUri(editArtworkUri ?: old.mediaMetadata.artworkUri).build()).build()
-                            c.replaceMediaItem(idx, updated)
-                        }
-                        searchTrack = title; searchArtist = artist
-                        showMetadataDialog = false
-                        status = if (result.isSuccess) "Metadata berhasil ditulis ke file audio." else "Metadata tampilan diperbarui, tetapi penulisan file gagal: ${result.exceptionOrNull()?.message ?: "file tidak dapat ditulis"}"
+                    currentTitle = title; currentArtist = artist; currentAlbum = album
+                    prefs.edit().putString("current_title", title).putString("current_artist", artist).putString("current_album", album).apply()
+                    val c = controller
+                    val idx = c?.currentMediaItemIndex ?: -1
+                    if (c != null && idx >= 0 && idx < c.mediaItemCount) {
+                        val old = c.getMediaItemAt(idx)
+                        val updated = old.buildUpon().setMediaMetadata(old.mediaMetadata.buildUpon().setTitle(title).setArtist(artist).setAlbumTitle(album).build()).build()
+                        c.replaceMediaItem(idx, updated)
                     }
-                }) { Text("Simpan metadata") }
+                    searchTrack = title; searchArtist = artist
+                    showMetadataDialog = false
+                    status = "Keterangan lagu diperbarui di Lyra."
+                }) { Text("Simpan") }
             },
             dismissButton = { TextButton(onClick = { showMetadataDialog = false }) { Text("Batal") } }
         )
@@ -1134,12 +1060,10 @@ private fun AudioVisualizer(audioSessionId: Int, isPlaying: Boolean, modifier: M
     }
     var spectrum by remember(audioSessionId) { mutableStateOf(List(48) { 0.10f }) }
     var captureError by remember(audioSessionId) { mutableStateOf(false) }
-    var fftReceived by remember(audioSessionId) { mutableStateOf(false) }
 
     DisposableEffect(audioSessionId, isPlaying, hasPermission) {
         var visualizer: Visualizer? = null
         val mainHandler = Handler(Looper.getMainLooper())
-        fftReceived = false
         if (audioSessionId > 0 && isPlaying && hasPermission) {
             try {
                 val capture = Visualizer(audioSessionId)
@@ -1164,7 +1088,7 @@ private fun AudioVisualizer(audioSessionId: Int, isPlaying: Boolean, modifier: M
                             }
                             values[i] = (kotlin.math.ln(1.0 + peak) / kotlin.math.ln(1.0 + 180.0)).toFloat().coerceIn(0.04f, 1f)
                         }
-                        mainHandler.post { spectrum = values; fftReceived = true }
+                        mainHandler.post { spectrum = values }
                     }
                 }, Visualizer.getMaxCaptureRate() / 2, false, true)
                 capture.enabled = true
@@ -1193,7 +1117,7 @@ private fun AudioVisualizer(audioSessionId: Int, isPlaying: Boolean, modifier: M
             animation = androidx.compose.animation.core.tween(950, easing = androidx.compose.animation.core.LinearEasing)
         ), label = "visualizerPhase"
     )
-    val needsFallback = !hasPermission || captureError || audioSessionId <= 0 || (isPlaying && !fftReceived)
+    val needsFallback = !hasPermission || captureError || audioSessionId <= 0
     val renderSpectrum = if (needsFallback && isPlaying) List(48) { i ->
         (0.08f + 0.78f * kotlin.math.abs(kotlin.math.sin(phase + i * 0.42f)) * (0.35f + 0.65f * kotlin.math.abs(kotlin.math.sin(phase * 0.63f + i * 0.13f)))).coerceIn(0.05f, 0.95f)
     } else if (!isPlaying) List(48) { i -> 0.035f + 0.025f * kotlin.math.abs(kotlin.math.sin(i * 0.3f)) } else spectrum

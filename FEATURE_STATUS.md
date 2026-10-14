@@ -1,23 +1,32 @@
-# Lyra Player — Feature Status
+# Lyra Player — status fitur
 
-## Implemented in source (must still be tested on a real Android device)
-- Local music library scan and optional user-selected folder.
-- Media3 playback, queue controls, shuffle/repeat, favorites, playlists, recent tracks and play counts.
-- Dark mode, equalizer/bass boost, sleep timer, backup import/export, M3U import/export.
-- FFT visualizer with animated fallback when audio-session capture is unavailable; permission prompt for analysis.
-- Automatic LRCLIB lyric search with local cache and manual LRC import/export.
-- Edit individual lyric lines while preserving the line timestamp.
-- Enhanced-LRC word timing editor: capture playback position per word and export as Enhanced LRC.
-- Shift lyric timestamps and add a timestamp at current playback position.
-- Embed lyrics and write title, artist, album, genre, year, track number, composer and optional artwork using jaudiotagger for supported formats, subject to Android document-provider write permissions.
-- Lyrics home-screen widget.
-- GitHub Actions workflow for debug APK build and artifact upload.
+## Ditambahkan/diperbaiki pada pembaruan ini
+- Animasi visualizer fallback bergerak terus saat lagu diputar dan FFT tidak tersedia, sesi audio belum siap, atau izin belum diberikan.
+- FFT tetap digunakan jika efek `Visualizer` tersedia dan berhasil diaktifkan.
+- Editor lirik per baris sekarang memakai indeks baris asli sehingga baris lirik yang teksnya sama tidak salah diedit.
+- Tombol **Tanamkan lirik ke file audio** menulis lirik ke field tag `LYRICS` menggunakan jaudiotagger untuk format yang didukung.
+- Perbaikan baris izin AndroidManifest yang sebelumnya mengandung karakter `\\n` literal.
+- Keterangan metadata di UI diperjelas agar tidak mengklaim tag judul/artis/album sudah ditulis ke file audio.
 
-## Limitations / validation still required
-- The Android build has not been run in this environment because Gradle/Android SDK downloads are unavailable here. Run the GitHub Actions workflow to verify compilation and download the APK artifact.
-- Tag write support depends on audio format and whether Android grants write access to the selected URI. If a MediaStore URI is read-only, choose the original audio file via **Pilih file** and grant access. A failed write is reported in the app status.
-- Embedded artwork support depends on the audio container/jaudiotagger format implementation.
-- Enhanced LRC word-level timestamps are not supported by every third-party lyric renderer; line-level playback remains supported by Lyra.
-- The editor captures timestamps manually while the song plays; it cannot infer exact phoneme/word boundaries automatically.
-- Metadata edits are written to the file when possible; Android's MediaStore index may require a rescan or app restart to reflect changed tags in other apps.
-- No release signing, Play Store packaging, or physical-device compatibility test is included.
+## Sudah ada di proyek
+- Pemutar audio Media3, perpustakaan musik, pencarian, antrean, shuffle/repeat.
+- Playlist, favorit, riwayat/penghitungan putar, timer tidur.
+- Pencarian lirik LRCLIB, cache lirik lokal, impor dan ekspor `.lrc`.
+- Editor teks lirik, tambah cap waktu dari posisi pemutaran, geser semua cap waktu ±0,5 detik.
+- Widget lirik, pengaturan tema, equalizer/bass boost bergantung dukungan perangkat.
+- Backup/restore sebagian pengaturan, playlist, favorit, dan riwayat.
+
+## Belum tersedia atau masih perlu pengerjaan/pengujian
+1. **Menulis judul/artis/album ke tag audio asli** — edit metadata saat ini hanya memperbarui sesi/UI Lyra.
+2. **Penyematan lirik belum universal** — bergantung format/tag dan izin tulis URI. MP3/FLAC/OGG lebih mungkin didukung; M4A/AAC/WAV dan penyedia berkas tertentu bisa gagal.
+3. **Dialog izin Android untuk mengedit berkas MediaStore yang dilindungi** — belum ada alur `RecoverableSecurityException`/konfirmasi pengguna; jika gagal, ekspor LRC tetap menjadi alternatif.
+4. **Sinkronisasi kata-per-kata (karaoke)** — editor hanya menyunting baris, bukan tiap kata.
+5. **Editor cap waktu per baris dengan tombol sinkronisasi maju/mundur khusus** — saat ini cap waktu dibuat dari posisi playback dan seluruh LRC bisa digeser.
+6. **Pengambilan sampul dan pengeditan artwork/genre/nomor track/tahun/komposer** — belum tersedia.
+7. **Penyimpanan metadata override per lagu setelah pemindaian ulang atau restart** — belum dijamin konsisten.
+8. **Pengujian build APK di GitHub Actions dan pengujian perangkat nyata** — belum dapat dinyatakan lulus hanya dari perubahan sumber.
+9. **Visualizer FFT lintas semua perangkat** — Android/OEM dapat menolak efek audio; fallback tersedia, tetapi spektrum real-time perlu diuji di perangkat.
+10. **Lirik offline lengkap dan pengunduhan otomatis batch** — cache tersedia, namun belum ada pengelola unduhan lirik massal.
+
+## Catatan build
+Proyek membutuhkan koneksi Gradle untuk mengambil dependensi, termasuk `net.jthink:jaudiotagger:3.0.1`. Jalankan workflow GitHub Actions dan periksa log build sebelum mendistribusikan APK.
