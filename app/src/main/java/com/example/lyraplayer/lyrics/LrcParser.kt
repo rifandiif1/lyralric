@@ -1,66 +1,83 @@
 package com.example.lyraplayer.lyrics
 
-data class LyricLine(val timeMs: Long, val text: String)
+import java.util.Locale
+
+data class LrcLine(val timeMs: Long, val text: String)
 
 object LrcParser {
-    private val timeRegex = Regex("\\[(\\d{1,3}):(\\d{2})(?:[.:](\\d{1,3}))?]")
+    private val lineRegex = Regex("\\[(\\d{1,2}):(\\d{2})(?:[.:](\\d{1,3}))?\\]")
+    private val wordTagRegex = Regex("<(\\d{1,2}):(\\d{2})(?:[.:](\\d{1,3}))?>")
+    private val anyTimeTagRegex = Regex("(\\[|<)(\\d{1,2}):(\\d{2})(?:[.:](\\d{1,3}))?(\\]|>)")
 
-    /** Supports multiple timestamps per line, [mm:ss], [mm:ss.d], [mm:ss.dd] and [mm:ss.ddd]. */
-    fun parse(lrc: String): List<LyricLine> = lrc.lineSequence().flatMap { rawLine ->
-        val line = rawLine.removePrefix("\uFEFF")
-        val matches = timeRegex.findAll(line).toList()
-        if (matches.isEmpty()) emptySequence() else {
-            val text = timeRegex.replace(line, "").trim()
-            matches.asSequence().mapNotNull { match ->
-                val minutes = match.groupValues[1].toLongOrNull() ?: return@mapNotNull null
-                val seconds = match.groupValues[2].toLongOrNull() ?: return@mapNotNull null
-                if (seconds > 59) return@mapNotNull null
-                val fraction = match.groupValues[3]
-                val millis = when (fraction.length) {
-                    1 -> fraction.toLongOrNull()?.times(100) ?: 0L
-                    2 -> fraction.toLongOrNull()?.times(10) ?: 0L
-                    3 -> fraction.toLongOrNull() ?: 0L
-                    else -> 0L
-                }
-                LyricLine((minutes * 60 + seconds) * 1000 + millis, text)
-            }
+    private fun parseTimeMs(minStr: String, secStr: String, fracStr: String?): Long {
+        val min = minStr.toLongOrNull() ?: 0L
+        val sec = secStr.toLongOrNull() ?: 0L
+        val frac = when (fracStr?.length ?: 0) {
+            1 -> (fracStr?.toLongOrNull() ?: 0L) * 100L
+            2 -> (fracStr?.toLongOrNull() ?: 0L) * 10L
+            3 -> fracStr?.toLongOrNull() ?: 0L
+            else -> 0L
         }
-    }.sortedBy { it.timeMs }.toList()
-
-    fun currentLine(lines: List<LyricLine>, positionMs: Long): LyricLine? =
-        lines.lastOrNull { it.timeMs <= positionMs.coerceAtLeast(0L) }
-
-    /** Plain-text lyric files have no timing; show their first meaningful line as a useful fallback. */
-    fun displayLine(lrc: String, positionMs: Long): String {
-        val lines = parse(lrc)
-        currentLine(lines, positionMs)?.text?.takeIf { it.isNotBlank() }?.let { return it }
-        if (lines.isNotEmpty()) return "Lirik belum dimulai"
-        return lrc.lineSequence()
-            .map { it.trim() }
-            .firstOrNull { it.isNotBlank() && !it.startsWith("[") }
-            .orEmpty()
-            .ifBlank { "Lirik belum tersedia" }
+        return min * 60_000L + sec * 1_000L + frac
     }
 
-    fun shift(lrc: String, offsetMs: Long): String = lrc.lineSequence().joinToString("\n") { line ->
-        timeRegex.replace(line) { match ->
-            val min = match.groupValues[1].toLongOrNull() ?: 0L
-            val sec = match.groupValues[2].toLongOrNull() ?: 0L
-            val fraction = match.groupValues[3]
-            val ms = when (fraction.length) {
-                1 -> fraction.toLongOrNull()?.times(100) ?: 0L
-                2 -> fraction.toLongOrNull()?.times(10) ?: 0L
-                3 -> fraction.toLongOrNull() ?: 0L
-                else -> 0L
+    fun parse(lrcContent: String): List<LrcLine> {
+        if (lrcContent.isBlank()) return emptyList()
+        val entries = mutableListOf<LrcLine>()
+
+        for (raw in lrcContent.lines()) {
+            val trimmed = raw.trim()
+            if (trimmed.isBlank()) continue
+            val prefixMatch = Regex("^(?:\\[\\d{1,2}:\\d{2}(?:[.:]\\d{1,3})?\\])+").find(trimmed)
+            if (prefixMatch != null) {
+                val prefix = prefixMatch.value
+                val body = trimmed.substring(prefix.length).trim()
+                val cleanBody = body.replace(wordTagRegex, "").replace(lineRegex, "").trim()
+                for (m in lineRegex.findAll(prefix)) {
+                    val ms = parseTimeMs(m.groupValues[1], m.groupValues[2], m.groupValues.getOrNull(3))
+                    entries.add(LrcLine(ms, cleanBody))
+                }
             }
-            val shifted = (((min * 60 + sec) * 1000 + ms) + offsetMs).coerceAtLeast(0L)
-            val totalSeconds = shifted / 1000
-            "[%02d:%02d.%03d]".format(totalSeconds / 60, totalSeconds % 60, shifted % 1000)
         }
+        return entries.sortedBy { it.timeMs }
+    }
+
+    fun displayLine(lrcContent: String, positionMs: Long): String {
+        if (lrcContent.isBlank()) return ""
+        val parsed = parse(lrcContent)
+        if (parsed.isNotEmpty()) {
+            val active = parsed.lastOrNull { it.timeMs <= positionMs } ?: parsed.first()
+            return active.text
+        }
+        return lrcContent.lines()
+            .map { it.replace(wordTagRegex, "").trim() }
+            .firstOrNull { it.isNotBlank() && !it.startsWith("[") }
+            .orEmpty()
     }
 
     fun timestamp(positionMs: Long): String {
         val safe = positionMs.coerceAtLeast(0L)
-        return "[%02d:%02d.%03d]".format(safe / 60_000, (safe / 1_000) % 60, safe % 1_000)
+        val min = safe / 60_000L
+        val sec = (safe % 60_000L) / 1_000L
+        val cs = (safe % 1_000L) / 10L
+        return String.format(Locale.ROOT, "[%02d:%02d.%02d]", min, sec, cs)
+    }
+
+    fun shift(lrcContent: String, offsetMs: Long): String {
+        if (lrcContent.isBlank() || offsetMs == 0L) return lrcContent
+        return anyTimeTagRegex.replace(lrcContent) { match ->
+            val open = match.groupValues[1]
+            val close = match.groupValues[5]
+            val currentMs = parseTimeMs(
+                match.groupValues[2],
+                match.groupValues[3],
+                match.groupValues.getOrNull(4)
+            )
+            val shifted = (currentMs + offsetMs).coerceAtLeast(0L)
+            val min = shifted / 60_000L
+            val sec = (shifted % 60_000L) / 1_000L
+            val cs = (shifted % 1_000L) / 10L
+            String.format(Locale.ROOT, "%s%02d:%02d.%02d%s", open, min, sec, cs, close)
+        }
     }
 }
