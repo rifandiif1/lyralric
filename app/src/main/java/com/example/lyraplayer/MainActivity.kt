@@ -3,6 +3,7 @@ package com.example.lyraplayer
 import android.Manifest
 import android.content.ComponentName
 import android.content.ContentUris
+import android.content.ContentValues
 import android.content.Context
 import android.content.SharedPreferences
 import android.content.pm.PackageManager
@@ -60,6 +61,7 @@ import androidx.core.content.ContextCompat
 import androidx.documentfile.provider.DocumentFile
 import androidx.media3.common.MediaItem
 import androidx.media3.common.MediaMetadata
+import androidx.media3.common.PlaybackParameters
 import androidx.media3.common.Player
 import androidx.media3.session.MediaController
 import androidx.media3.session.SessionToken
@@ -77,6 +79,8 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
+import java.text.SimpleDateFormat
+import java.util.Date
 import java.util.Locale
 import kotlin.math.abs
 import kotlin.math.ln
@@ -85,7 +89,20 @@ import kotlin.math.sin
 import kotlin.math.sqrt
 
 // === 1. MODELS, ENUMS & HELPERS ===
-private data class AudioTrack(val id: String, val uri: Uri, val title: String, val artist: String, val album: String, val duration: Long, val folder: String = "", val isSaf: Boolean = false, val artworkUri: Uri? = null)
+private data class AudioTrack(
+    val id: String,
+    val uri: Uri,
+    val title: String,
+    val artist: String,
+    val album: String,
+    val duration: Long,
+    val dateAddedSec: Long = 0L,
+    val filePath: String = "",
+    val folder: String = "",
+    val isSaf: Boolean = false,
+    val artworkUri: Uri? = null
+)
+
 private data class MetadataOverride(val title: String, val artist: String, val album: String, val artworkUri: String = "")
 private data class LyraPlaylist(val name: String, val trackIds: List<String>)
 private data class KaraokeWord(val text: String, val startMs: Long, val endMs: Long)
@@ -93,7 +110,25 @@ private data class KaraokeLine(val startMs: Long, val endMs: Long, val plainText
 
 private enum class LyraTab(val label: String) { HOME("Home"), NOW_PLAYING("Putar"), LIBRARY("Musik"), LYRICS("Lirik"), SETTINGS("Setelan") }
 private enum class LibrarySubTab(val title: String) { ALL("Semua Lagu"), FAVORITES("Favorit"), PLAYLISTS("Playlist"), QUEUE("Antrean") }
-private enum class SortOption(val label: String) { TITLE_ASC("Judul A-Z"), TITLE_DESC("Judul Z-A"), ARTIST_ASC("Artis A-Z"), DURATION_DESC("Terpanjang"), DURATION_ASC("Terpendek"), MOST_PLAYED("Sering Diputar") }
+
+private enum class SortOption(val label: String) {
+    DATE_ADDED_DESC("Terbaru Ditambahkan"),
+    DATE_ADDED_ASC("Terlama Ditambahkan"),
+    TITLE_ASC("Judul A-Z"),
+    TITLE_DESC("Judul Z-A"),
+    ARTIST_ASC("Artis A-Z"),
+    DURATION_DESC("Terpanjang"),
+    DURATION_ASC("Terpendek"),
+    MOST_PLAYED("Sering Diputar")
+}
+
+private enum class VisualizerStyle(val label: String) {
+    NEON_BARS("Neon Bars"),
+    MIRROR_WAVE("Mirror Wave"),
+    CYBER_DOTS("Cyber Dots"),
+    PULSE_LINE("Pulse Line")
+}
+
 private enum class LyricsSubTab(val title: String) { PREVIEW("♪ Karaoke"), SEARCH("⌕ Cari Online"), EDITOR("✎ Studio LRC") }
 private enum class LyraIconType { HOME, PLAY, PAUSE, NEXT, PREV, SHUFFLE, REPEAT_OFF, REPEAT_ALL, REPEAT_ONE, HEART_FILLED, HEART_OUTLINE, EDIT, PLUS, QUEUE, MUSIC, LYRICS, SETTINGS, SEARCH }
 
@@ -103,6 +138,13 @@ private fun lyricsCacheKey(title: String, artist: String): String =
 private fun formatTime(ms: Long): String {
     val total = (ms.coerceAtLeast(0L) / 1000L).toInt()
     return String.format(Locale.ROOT, "%d:%02d", total / 60, total % 60)
+}
+
+private fun formatAddedDate(sec: Long): String {
+    if (sec <= 0L) return ""
+    return runCatching {
+        SimpleDateFormat("dd MMM yy", Locale.getDefault()).format(Date(sec * 1000L))
+    }.getOrDefault("")
 }
 
 private fun cleanSearchQuery(rawTitle: String, rawArtist: String): Pair<String, String> {
@@ -173,10 +215,15 @@ private fun loadMetadataOverrides(raw: String): Map<String, MetadataOverride> = 
     m
 }.getOrDefault(emptyMap())
 
+// commit() digunakan agar penyimpanan ke disk bersifat sinkron dan langsung permanen seketika
 private fun saveMetadataOverrides(prefs: SharedPreferences, map: Map<String, MetadataOverride>) {
     val root = JSONObject()
-    for ((k, v) in map.entries) root.put(k, JSONObject().put("title", v.title).put("artist", v.artist).put("album", v.album).put("artworkUri", v.artworkUri))
-    prefs.edit().putString("metadata_overrides_json", root.toString()).apply()
+    for ((k, v) in map.entries) {
+        if (k.isNotBlank()) {
+            root.put(k, JSONObject().put("title", v.title).put("artist", v.artist).put("album", v.album).put("artworkUri", v.artworkUri))
+        }
+    }
+    prefs.edit().putString("metadata_overrides_json", root.toString()).commit()
 }
 
 // === 2. ENHANCED LRC KARAOKE ENGINE ===
@@ -396,6 +443,7 @@ private fun TrackList(tracks: List<AudioTrack>, currentUri: Uri?, playing: Boole
     LazyColumn(modifier.fillMaxWidth(), contentPadding = PaddingValues(bottom = 14.dp), verticalArrangement = Arrangement.spacedBy(2.dp)) {
         items(tracks, key = { it.id }) { song ->
             val isCurrent = song.uri == currentUri; val isFav = song.id in favoriteIds
+            val addedStr = remember(song.dateAddedSec) { formatAddedDate(song.dateAddedSec) }
             Row(Modifier.fillMaxWidth().clip(RoundedCornerShape(14.dp)).background(if (isCurrent) MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.65f) else Color.Transparent).clickable { playTracks(tracks, tracks.indexOfFirst { it.id == song.id }) }.padding(vertical = 8.dp, horizontal = 6.dp), verticalAlignment = Alignment.CenterVertically) {
                 Surface(shape = RoundedCornerShape(12.dp), color = MaterialTheme.colorScheme.surfaceVariant, modifier = Modifier.size(48.dp)) {
                     if (song.artworkUri != null) AsyncImage(model = song.artworkUri, contentDescription = null, modifier = Modifier.fillMaxSize(), contentScale = ContentScale.Crop)
@@ -407,7 +455,10 @@ private fun TrackList(tracks: List<AudioTrack>, currentUri: Uri?, playing: Boole
                         if (song.duration > 0L) Text(formatTime(song.duration), style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.primary)
                         Text("${song.artist} · ${song.album}", maxLines = 1, overflow = TextOverflow.Ellipsis, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                     }
-                    if (showFolder && song.folder.isNotBlank()) Text(song.folder, maxLines = 1, overflow = TextOverflow.Ellipsis, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.outline)
+                    if (showFolder && (song.folder.isNotBlank() || addedStr.isNotBlank())) {
+                        val subInfo = listOfNotNull(addedStr.takeIf { it.isNotBlank() }?.let { "Ditambahkan $it" }, song.folder.takeIf { it.isNotBlank() }).joinToString(" • ")
+                        Text(subInfo, maxLines = 1, overflow = TextOverflow.Ellipsis, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.outline)
+                    }
                 }
                 IconButton(onClick = { onEditTrack(song) }, modifier = Modifier.size(34.dp)) { LyraVectorIcon(LyraIconType.EDIT, tint = MaterialTheme.colorScheme.onSurfaceVariant, size = 18.dp) }
                 IconButton(onClick = { toggleFavorite(song) }, modifier = Modifier.size(34.dp)) { LyraVectorIcon(if (isFav) LyraIconType.HEART_FILLED else LyraIconType.HEART_OUTLINE, tint = if (isFav) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant, size = 18.dp) }
@@ -434,7 +485,7 @@ private fun KaraokeWordText(line: KaraokeLine, positionMs: Long, isCurrentLine: 
                     val dur = (word.endMs - word.startMs).coerceAtLeast(1L)
                     val splitIdx = (word.text.length * ((positionMs - word.startMs).toFloat() / dur.toFloat()).coerceIn(0f, 1f)).toInt().coerceIn(0, word.text.length)
                     withStyle(SpanStyle(color = activeColor, fontWeight = FontWeight.Black)) { append(word.text.substring(0, splitIdx)) }
-                    withStyle(SpanStyle(color = activeColor.copy(alpha = 0.65f), fontWeight = FontWeight.ExtraBold)) { append(word.text.substring(splitIdx)) }
+                    withStyle(SpanStyle(color = activeColor.copy(alpha = 0.65f), fontWeight = FontWeight.ExtraBold)) { append(word.text.substring(splitIndex = splitIdx)) }
                 }
                 else -> withStyle(SpanStyle(color = unsungColor, fontWeight = FontWeight.Bold)) { append(word.text) }
             }
@@ -523,7 +574,28 @@ private fun EqualizerPanel(audioSessionId: Int) {
         }
     }
     if (audioSessionId <= 0 || eq == null) { Text("Mulai putar lagu untuk mengaktifkan equalizer.", style = MaterialTheme.typography.bodySmall); return }
-    Row(verticalAlignment = Alignment.CenterVertically) { Text("Equalizer", Modifier.weight(1f), fontWeight = FontWeight.SemiBold); Switch(checked = enabled, onCheckedChange = { v -> enabled = v; runCatching { eq.enabled = v } }) }
+    Row(verticalAlignment = Alignment.CenterVertically) { Text("Equalizer Studio", Modifier.weight(1f), fontWeight = FontWeight.SemiBold); Switch(checked = enabled, onCheckedChange = { v -> enabled = v; runCatching { eq.enabled = v } }) }
+    // Preset Cepat Equalizer
+    val presets = listOf(
+        "Flat" to listOf(0f, 0f, 0f, 0f, 0f),
+        "Bass+" to listOf(0.7f, 0.4f, 0f, 0.1f, 0.2f),
+        "Vocal/Karaoke" to listOf(-0.3f, 0.2f, 0.75f, 0.6f, 0.1f),
+        "Pop" to listOf(0.3f, 0.5f, 0.2f, 0.4f, 0.4f),
+        "Rock" to listOf(0.6f, 0.2f, -0.2f, 0.4f, 0.7f)
+    )
+    Row(Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+        presets.forEach { (name, ratios) ->
+            AssistChip(
+                onClick = {
+                    enabled = true; runCatching { eq.enabled = true }
+                    val updated = bandValues.indices.map { i -> (ratios.getOrElse(i) { 0f } * range).coerceIn(-range, range) }
+                    bandValues = updated
+                    updated.forEachIndexed { idx, v -> runCatching { eq.setBandLevel(idx.toShort(), v.toInt().toShort()) } }
+                },
+                label = { Text(name, fontSize = 11.sp) }
+            )
+        }
+    }
     bandValues.forEachIndexed { idx, value ->
         Column {
             Row(verticalAlignment = Alignment.CenterVertically) { Text(labels.getOrElse(idx) { "Band ${idx + 1}" }, Modifier.weight(1f), style = MaterialTheme.typography.bodySmall); Text("${value.toInt()} mB", style = MaterialTheme.typography.labelSmall) }
@@ -538,7 +610,13 @@ private fun EqualizerPanel(audioSessionId: Int) {
 }
 
 @Composable
-private fun AudioVisualizer(audioSessionId: Int, isPlaying: Boolean, modifier: Modifier = Modifier) {
+private fun AudioVisualizer(
+    audioSessionId: Int,
+    isPlaying: Boolean,
+    style: VisualizerStyle,
+    onCycleStyle: () -> Unit,
+    modifier: Modifier = Modifier
+) {
     val context = LocalContext.current
     var hasPermission by remember { mutableStateOf(ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) }
     val permissionLauncher = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { hasPermission = it }
@@ -597,15 +675,52 @@ private fun AudioVisualizer(audioSessionId: Int, isPlaying: Boolean, modifier: M
 
     Column(modifier, verticalArrangement = Arrangement.spacedBy(4.dp)) {
         Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.SpaceBetween) {
-            Text("LIVE AUDIO SPECTRUM", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.primary, fontWeight = FontWeight.Bold)
+            Text(
+                "SPECTRUM: ${style.label.uppercase()} ↻",
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.primary,
+                fontWeight = FontWeight.Bold,
+                modifier = Modifier.clickable { onCycleStyle() }
+            )
             if (!hasPermission) Text("Izinkan mikrofon (FFT) →", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.primary, modifier = Modifier.clickable { permissionLauncher.launch(Manifest.permission.RECORD_AUDIO) })
-            else Text(when { !isPlaying -> "SIAP SAAT MUSIK DIPUTAR"; hasActiveSignal && !captureError -> "REAL-TIME FFT + WAVE"; else -> "DYNAMIC PULSE" }, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            else Text(when { !isPlaying -> "STANDBY"; hasActiveSignal && !captureError -> "REAL-TIME FFT"; else -> "PULSE ENGINE" }, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
         }
-        Canvas(Modifier.fillMaxWidth().height(48.dp)) {
-            val count = renderSpectrum.size; val gap = 2.4f; val barWidth = ((size.width - gap * (count - 1)) / count).coerceAtLeast(1.5f)
-            for (i in 0 until count) {
-                val h = size.height * renderSpectrum[i].coerceIn(0.04f, 1f)
-                drawRoundRect(Brush.verticalGradient(listOf(Color(0xFFD9FF9A), Color(0xFF8FE03C), Color(0xFF315B18))), Offset(i * (barWidth + gap), size.height - h), Size(barWidth, h), CornerRadius(barWidth / 2f, barWidth / 2f))
+        Canvas(Modifier.fillMaxWidth().height(48.dp).clickable { onCycleStyle() }) {
+            val count = renderSpectrum.size
+            val gap = 2.4f
+            val barWidth = ((size.width - gap * (count - 1)) / count).coerceAtLeast(1.5f)
+            when (style) {
+                VisualizerStyle.NEON_BARS -> {
+                    for (i in 0 until count) {
+                        val h = size.height * renderSpectrum[i].coerceIn(0.04f, 1f)
+                        drawRoundRect(Brush.verticalGradient(listOf(Color(0xFFD9FF9A), Color(0xFF8FE03C), Color(0xFF315B18))), Offset(i * (barWidth + gap), size.height - h), Size(barWidth, h), CornerRadius(barWidth / 2f, barWidth / 2f))
+                    }
+                }
+                VisualizerStyle.MIRROR_WAVE -> {
+                    val centerY = size.height / 2f
+                    for (i in 0 until count) {
+                        val h = (size.height * renderSpectrum[i].coerceIn(0.06f, 1f)).coerceAtLeast(4f)
+                        drawRoundRect(Brush.verticalGradient(listOf(Color(0xFF8FE03C), Color(0xFFD9FF9A), Color(0xFF8FE03C))), Offset(i * (barWidth + gap), centerY - h / 2f), Size(barWidth, h), CornerRadius(barWidth / 2f, barWidth / 2f))
+                    }
+                }
+                VisualizerStyle.CYBER_DOTS -> {
+                    for (i in 0 until count) {
+                        val frac = renderSpectrum[i].coerceIn(0.05f, 1f)
+                        val x = i * (barWidth + gap) + barWidth / 2f
+                        val y = size.height - (size.height * frac)
+                        drawLine(Color(0xFF315B18).copy(alpha = 0.55f), Offset(x, size.height), Offset(x, y), strokeWidth = barWidth * 0.45f)
+                        drawCircle(Color(0xFFD9FF9A), radius = barWidth * 0.65f, center = Offset(x, y.coerceIn(4f, size.height - 4f)))
+                    }
+                }
+                VisualizerStyle.PULSE_LINE -> {
+                    val path = Path()
+                    for (i in 0 until count) {
+                        val x = i * (barWidth + gap) + barWidth / 2f
+                        val y = size.height - (size.height * renderSpectrum[i].coerceIn(0.05f, 0.95f))
+                        if (i == 0) path.moveTo(x, y) else path.lineTo(x, y)
+                    }
+                    drawPath(path, Brush.horizontalGradient(listOf(Color(0xFF8FE03C), Color(0xFFD9FF9A), Color(0xFF8FE03C))), style = Stroke(width = 3.5f, cap = StrokeCap.Round, join = StrokeJoin.Round))
+                }
             }
         }
     }
@@ -638,9 +753,16 @@ private fun LyraApp() {
     var isSearchingLyrics by remember { mutableStateOf(false) }
 
     var minDurationSec by remember { mutableIntStateOf(prefs.getInt("min_duration_sec", 30)) }
-    var sortOption by remember { mutableStateOf(runCatching { SortOption.valueOf(prefs.getString("sort_option", SortOption.TITLE_ASC.name).orEmpty()) }.getOrDefault(SortOption.TITLE_ASC)) }
+    var sortOption by remember { mutableStateOf(runCatching { SortOption.valueOf(prefs.getString("sort_option", SortOption.DATE_ADDED_DESC.name).orEmpty()) }.getOrDefault(SortOption.DATE_ADDED_DESC)) }
+    var visualizerStyle by remember { mutableStateOf(runCatching { VisualizerStyle.valueOf(prefs.getString("visualizer_style", VisualizerStyle.NEON_BARS.name).orEmpty()) }.getOrDefault(VisualizerStyle.NEON_BARS)) }
     var autoWordKaraoke by remember { mutableStateOf(prefs.getBoolean("auto_word_karaoke", true)) }
+
+    // Fitur Pitch (Semitone) & Speed Studio + A-B Repeat Loop
     var playbackSpeed by remember { mutableFloatStateOf(1.0f) }
+    var pitchSemitones by remember { mutableIntStateOf(0) }
+    var showAudioLabDialog by remember { mutableStateOf(false) }
+    var loopStartMs by remember { mutableStateOf<Long?>(null) }
+    var loopEndMs by remember { mutableStateOf<Long?>(null) }
 
     var playing by remember { mutableStateOf(false) }
     var audioSessionId by remember { mutableIntStateOf(prefs.getInt("audio_session_id", 0)) }
@@ -686,6 +808,11 @@ private fun LyraApp() {
 
     fun permissionName() = if (Build.VERSION.SDK_INT >= 33) Manifest.permission.READ_MEDIA_AUDIO else Manifest.permission.READ_EXTERNAL_STORAGE
 
+    fun applyPlaybackParams(speed: Float, semitones: Int) {
+        val pitchFactor = 2.0.pow(semitones / 12.0).toFloat().coerceIn(0.5f, 2.0f)
+        runCatching { controller?.playbackParameters = PlaybackParameters(speed.coerceIn(0.5f, 2.0f), pitchFactor) }
+    }
+
     fun saveLrcToCache(lyrics: String, title: String = currentTitle, artist: String = currentArtist) {
         val key = lyricsCacheKey(title, artist)
         val cache = runCatching { JSONObject(prefs.getString("lyrics_cache_json", "{}").orEmpty()) }.getOrElse { JSONObject() }
@@ -709,26 +836,53 @@ private fun LyraApp() {
         }
     }
 
+    // Pencocokan 3 lapis (ID, URI, dan FilePath) agar edit detail lagu benar-benar permanen
+    fun findOverrideFor(id: String, uriStr: String, filePath: String = "", overrides: Map<String, MetadataOverride> = metadataOverrides): MetadataOverride? {
+        return overrides[id]
+            ?: overrides[uriStr]
+            ?: (if (filePath.isNotBlank()) overrides["path:$filePath"] else null)
+    }
+
     fun applyTrackOverride(raw: AudioTrack, overrides: Map<String, MetadataOverride> = metadataOverrides): AudioTrack {
-        val ov = overrides[raw.id] ?: overrides[raw.uri.toString()] ?: return raw
+        val ov = findOverrideFor(raw.id, raw.uri.toString(), raw.filePath, overrides) ?: return raw
         val customArt = ov.artworkUri.takeIf { it.isNotBlank() }?.let { runCatching { Uri.parse(it) }.getOrNull() } ?: raw.artworkUri
         return raw.copy(title = ov.title.ifBlank { raw.title }, artist = ov.artist.ifBlank { raw.artist }, album = ov.album.ifBlank { raw.album }, artworkUri = customArt)
     }
 
     fun openMetadataEditor(track: AudioTrack?) {
-        editingTrackTarget = track; editTitle = track?.title ?: currentTitle; editArtist = track?.artist ?: currentArtist
-        editAlbum = track?.album ?: currentAlbum; editArtworkUri = track?.artworkUri?.toString().orEmpty(); showMetadataDialog = true
+        editingTrackTarget = track
+        editTitle = track?.title ?: currentTitle
+        editArtist = track?.artist ?: currentArtist
+        editAlbum = track?.album ?: currentAlbum
+        editArtworkUri = track?.artworkUri?.toString().orEmpty()
+        showMetadataDialog = true
     }
 
     fun scanSongs() {
         try {
+            val latestOverrides = loadMetadataOverrides(prefs.getString("metadata_overrides_json", "{}").orEmpty())
+            metadataOverrides = latestOverrides
             val collection = MediaStore.Audio.Media.EXTERNAL_CONTENT_URI
-            val projection = arrayOf(MediaStore.Audio.Media._ID, MediaStore.Audio.Media.TITLE, MediaStore.Audio.Media.ARTIST, MediaStore.Audio.Media.ALBUM, MediaStore.Audio.Media.DURATION, MediaStore.Audio.Media.DATA, MediaStore.Audio.Media.ALBUM_ID)
+            val projection = arrayOf(
+                MediaStore.Audio.Media._ID,
+                MediaStore.Audio.Media.TITLE,
+                MediaStore.Audio.Media.ARTIST,
+                MediaStore.Audio.Media.ALBUM,
+                MediaStore.Audio.Media.DURATION,
+                MediaStore.Audio.Media.DATA,
+                MediaStore.Audio.Media.ALBUM_ID,
+                MediaStore.Audio.Media.DATE_ADDED
+            )
             val found = linkedMapOf<String, AudioTrack>()
-            context.contentResolver.query(collection, projection, "${MediaStore.Audio.Media.IS_MUSIC} != 0", null, "${MediaStore.Audio.Media.TITLE} COLLATE NOCASE ASC")?.use { cursor: Cursor ->
-                val idCol = cursor.getColumnIndexOrThrow(MediaStore.Audio.Media._ID); val titleCol = cursor.getColumnIndexOrThrow(MediaStore.Audio.Media.TITLE)
-                val artistCol = cursor.getColumnIndexOrThrow(MediaStore.Audio.Media.ARTIST); val albumCol = cursor.getColumnIndexOrThrow(MediaStore.Audio.Media.ALBUM)
-                val durationCol = cursor.getColumnIndexOrThrow(MediaStore.Audio.Media.DURATION); val dataCol = cursor.getColumnIndex(MediaStore.Audio.Media.DATA); val albumIdCol = cursor.getColumnIndex(MediaStore.Audio.Media.ALBUM_ID)
+            context.contentResolver.query(collection, projection, "${MediaStore.Audio.Media.IS_MUSIC} != 0", null, "${MediaStore.Audio.Media.DATE_ADDED} DESC")?.use { cursor: Cursor ->
+                val idCol = cursor.getColumnIndexOrThrow(MediaStore.Audio.Media._ID)
+                val titleCol = cursor.getColumnIndexOrThrow(MediaStore.Audio.Media.TITLE)
+                val artistCol = cursor.getColumnIndexOrThrow(MediaStore.Audio.Media.ARTIST)
+                val albumCol = cursor.getColumnIndexOrThrow(MediaStore.Audio.Media.ALBUM)
+                val durationCol = cursor.getColumnIndexOrThrow(MediaStore.Audio.Media.DURATION)
+                val dataCol = cursor.getColumnIndex(MediaStore.Audio.Media.DATA)
+                val albumIdCol = cursor.getColumnIndex(MediaStore.Audio.Media.ALBUM_ID)
+                val dateAddedCol = cursor.getColumnIndex(MediaStore.Audio.Media.DATE_ADDED)
                 while (cursor.moveToNext()) {
                     val id = cursor.getLong(idCol).toString()
                     val title = cursor.getString(titleCol)?.takeIf { it.isNotBlank() } ?: "Judul tidak diketahui"
@@ -736,8 +890,21 @@ private fun LyraApp() {
                     val album = cursor.getString(albumCol)?.takeIf { it.isNotBlank() && it != "<unknown>" } ?: "Album tidak diketahui"
                     val path = if (dataCol >= 0) cursor.getString(dataCol).orEmpty() else ""
                     val albumId = if (albumIdCol >= 0) cursor.getLong(albumIdCol) else 0L
+                    val addedSec = if (dateAddedCol >= 0) cursor.getLong(dateAddedCol) else 0L
                     val art = if (albumId > 0L) ContentUris.withAppendedId(Uri.parse("content://media/external/audio/albumart"), albumId) else null
-                    found["media:$id"] = applyTrackOverride(AudioTrack("media:$id", Uri.withAppendedPath(collection, id), title, artist, album, cursor.getLong(durationCol), path.substringBeforeLast("/", ""), artworkUri = art))
+                    val rawTrack = AudioTrack(
+                        id = "media:$id",
+                        uri = Uri.withAppendedPath(collection, id),
+                        title = title,
+                        artist = artist,
+                        album = album,
+                        duration = cursor.getLong(durationCol),
+                        dateAddedSec = addedSec,
+                        filePath = path,
+                        folder = path.substringBeforeLast("/", ""),
+                        artworkUri = art
+                    )
+                    found["media:$id"] = applyTrackOverride(rawTrack, latestOverrides)
                 }
             }
             if (selectedFolder.isNotBlank()) {
@@ -748,8 +915,13 @@ private fun LyraApp() {
                         for (file in folder.listFiles()) {
                             if (file.isDirectory) visit(file, depth + 1)
                             else if (file.isFile && file.name.orEmpty().substringAfterLast('.', "").lowercase(Locale.ROOT) in setOf("mp3", "m4a", "aac", "flac", "wav", "ogg", "opus", "3gp", "mid", "amr")) {
-                                val id = "saf:${file.uri}"; val title = file.name.orEmpty().substringBeforeLast('.').ifBlank { "Audio tanpa judul" }
-                                if (!found.containsKey(id)) found[id] = applyTrackOverride(AudioTrack(id, file.uri, title, "Artis tidak diketahui", "Folder pilihan", 0L, file.parentFile?.name.orEmpty(), true))
+                                val id = "saf:${file.uri}"
+                                val title = file.name.orEmpty().substringBeforeLast('.').ifBlank { "Audio tanpa judul" }
+                                val modifiedSec = file.lastModified() / 1000L
+                                if (!found.containsKey(id)) {
+                                    val rawSaf = AudioTrack(id, file.uri, title, "Artis tidak diketahui", "Folder pilihan", 0L, modifiedSec, file.uri.path.orEmpty(), file.parentFile?.name.orEmpty(), true)
+                                    found[id] = applyTrackOverride(rawSaf, latestOverrides)
+                                }
                             }
                         }
                     }
@@ -757,7 +929,7 @@ private fun LyraApp() {
                 }
             }
             songs = found.values.toList()
-            status = if (songs.isEmpty()) "Belum ada lagu ditemukan." else "${songs.size} file audio terdeteksi."
+            status = if (songs.isEmpty()) "Belum ada lagu ditemukan." else "${songs.size} file audio siap diputar."
         } catch (e: Exception) { status = "Gagal membaca musik: ${e.message}" }
     }
 
@@ -826,10 +998,14 @@ private fun LyraApp() {
     fun playTracks(list: List<AudioTrack>, index: Int) {
         val c = controller ?: run { status = "Pemutar sedang disiapkan."; return }
         if (list.isEmpty() || index !in list.indices) return
-        val items = list.map { s -> MediaItem.Builder().setUri(s.uri).setMediaId(s.id).setMediaMetadata(MediaMetadata.Builder().setTitle(s.title).setArtist(s.artist).setAlbumTitle(s.album).setArtworkUri(s.artworkUri).build()).build() }
+        val items = list.map { rawSong ->
+            val s = applyTrackOverride(rawSong)
+            MediaItem.Builder().setUri(s.uri).setMediaId(s.id).setMediaMetadata(MediaMetadata.Builder().setTitle(s.title).setArtist(s.artist).setAlbumTitle(s.album).setArtworkUri(s.artworkUri).build()).build()
+        }
         c.setMediaItems(items, index, 0L); c.prepare(); c.play()
-        val tr = list[index]
+        val tr = applyTrackOverride(list[index])
         currentTitle = tr.title; currentArtist = tr.artist; currentAlbum = tr.album; currentUri = tr.uri
+        loopStartMs = null; loopEndMs = null
         val (cleanT, cleanA) = cleanSearchQuery(tr.title, tr.artist)
         searchTrack = cleanT; searchArtist = cleanA
         val newRecent = (listOf(tr.id) + lastPlayed.filterNot { it == tr.id }).take(60); lastPlayed = newRecent
@@ -850,7 +1026,7 @@ private fun LyraApp() {
         else permissionLauncher.launch(permissionName())
     }
 
-    LaunchedEffect(controller, metadataOverrides) {
+    LaunchedEffect(controller, metadataOverrides, songs, loopStartMs, loopEndMs) {
         val c = controller ?: return@LaunchedEffect
         var lastWidgetSync = 0L
         while (true) {
@@ -858,12 +1034,23 @@ private fun LyraApp() {
             position = c.currentPosition.coerceAtLeast(0L)
             duration = c.duration.takeIf { it > 0 && it != androidx.media3.common.C.TIME_UNSET } ?: 0L
             shuffle = c.shuffleModeEnabled; repeatMode = c.repeatMode
+
+            // Eksekusi A-B Repeat Loop jika diaktifkan
+            val lStart = loopStartMs; val lEnd = loopEndMs
+            if (lStart != null && lEnd != null && lEnd > lStart + 500L && position >= lEnd) {
+                c.seekTo(lStart)
+                position = lStart
+            }
+
             val activeUri = c.currentMediaItem?.localConfiguration?.uri; currentUri = activeUri
             val activeMediaId = c.currentMediaItem?.mediaId.orEmpty()
-            val ov = metadataOverrides[activeMediaId] ?: activeUri?.toString()?.let { metadataOverrides[it] }
-            currentTitle = ov?.title?.takeIf { it.isNotBlank() } ?: c.mediaMetadata.title?.toString()?.takeIf { it.isNotBlank() } ?: currentTitle
-            currentArtist = ov?.artist?.takeIf { it.isNotBlank() } ?: c.mediaMetadata.artist?.toString()?.takeIf { it.isNotBlank() } ?: currentArtist
-            currentAlbum = ov?.album?.takeIf { it.isNotBlank() } ?: c.mediaMetadata.albumTitle?.toString() ?: currentAlbum
+            val matchedSong = songs.firstOrNull { it.id == activeMediaId || it.uri == activeUri }
+            val ov = findOverrideFor(activeMediaId, activeUri?.toString().orEmpty(), matchedSong?.filePath.orEmpty())
+
+            currentTitle = ov?.title?.takeIf { it.isNotBlank() } ?: matchedSong?.title?.takeIf { it.isNotBlank() } ?: c.mediaMetadata.title?.toString()?.takeIf { it.isNotBlank() } ?: currentTitle
+            currentArtist = ov?.artist?.takeIf { it.isNotBlank() } ?: matchedSong?.artist?.takeIf { it.isNotBlank() } ?: c.mediaMetadata.artist?.toString()?.takeIf { it.isNotBlank() } ?: currentArtist
+            currentAlbum = ov?.album?.takeIf { it.isNotBlank() } ?: matchedSong?.album?.takeIf { it.isNotBlank() } ?: c.mediaMetadata.albumTitle?.toString() ?: currentAlbum
+
             currentLyric = EnhancedLrcEngine.stripEnhancedTags(LrcParser.displayLine(lrcText, position))
             val now = System.currentTimeMillis()
             if (now - lastWidgetSync > 450L) { lastWidgetSync = now; LyricsWidgetProvider.updateAll(context, currentTitle, currentLyric) }
@@ -899,13 +1086,18 @@ private fun LyraApp() {
         if (sleepMinutes > 0) { delay(sleepMinutes * 60_000L); controller?.pause(); sleepMinutes = 0; status = "Timer tidur selesai." }
     }
 
+    // Filter Durasi Minimal + Pencarian + Pengurutan (Termasuk Waktu Ditambahkan)
     val durationFilteredSongs = remember(songs, minDurationSec) {
         val minMs = minDurationSec * 1000L
         songs.filter { it.isSaf || it.duration == 0L || it.duration >= minMs }
     }
     val sortedAndFilteredSongs = remember(durationFilteredSongs, search, sortOption, playCounts) {
-        val base = if (search.isBlank()) durationFilteredSongs else durationFilteredSongs.filter { it.title.contains(search, true) || it.artist.contains(search, true) || it.album.contains(search, true) || it.folder.contains(search, true) }
+        val base = if (search.isBlank()) durationFilteredSongs else durationFilteredSongs.filter {
+            it.title.contains(search, true) || it.artist.contains(search, true) || it.album.contains(search, true) || it.folder.contains(search, true)
+        }
         when (sortOption) {
+            SortOption.DATE_ADDED_DESC -> base.sortedWith(compareByDescending<AudioTrack> { it.dateAddedSec }.thenBy { it.title.lowercase(Locale.ROOT) })
+            SortOption.DATE_ADDED_ASC -> base.sortedWith(compareBy<AudioTrack> { it.dateAddedSec }.thenBy { it.title.lowercase(Locale.ROOT) })
             SortOption.TITLE_ASC -> base.sortedBy { it.title.lowercase(Locale.ROOT) }
             SortOption.TITLE_DESC -> base.sortedByDescending { it.title.lowercase(Locale.ROOT) }
             SortOption.ARTIST_ASC -> base.sortedBy { it.artist.lowercase(Locale.ROOT) }
@@ -990,9 +1182,9 @@ private fun LyraApp() {
                                     Text("PLAYING NOW", style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.primary, fontWeight = FontWeight.Black)
                                     Text(currentTitle, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold, maxLines = 1, overflow = TextOverflow.Ellipsis)
                                     Text(currentArtist.ifBlank { "Pilih lagu untuk mulai" }, style = MaterialTheme.typography.bodySmall, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                                    Text("Filter ≥${minDurationSec}s aktif · ${durationFilteredSongs.size} lagu", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.primary, modifier = Modifier.padding(top = 4.dp))
+                                    Text("Urutan: ${sortOption.label} · ≥${minDurationSec}s", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.primary, modifier = Modifier.padding(top = 4.dp))
                                 }
-                                FilledTonalIconButton(onClick = { if (playing) controller?.pause() else if (currentUri != null) controller?.play() else if (durationFilteredSongs.isNotEmpty()) playTracks(durationFilteredSongs, 0) }, modifier = Modifier.size(48.dp)) {
+                                FilledTonalIconButton(onClick = { if (playing) controller?.pause() else if (currentUri != null) controller?.play() else if (sortedAndFilteredSongs.isNotEmpty()) playTracks(sortedAndFilteredSongs, 0) }, modifier = Modifier.size(48.dp)) {
                                     LyraVectorIcon(if (playing) LyraIconType.PAUSE else LyraIconType.PLAY, tint = MaterialTheme.colorScheme.primary, size = 22.dp)
                                 }
                             }
@@ -1029,20 +1221,23 @@ private fun LyraApp() {
                                 }
                             }
                             Row(verticalAlignment = Alignment.CenterVertically) {
-                                TextButton(onClick = { val sp = listOf(0.75f, 1.0f, 1.25f, 1.5f); val nx = sp[(sp.indexOf(playbackSpeed) + 1) % sp.size]; playbackSpeed = nx; controller?.setPlaybackSpeed(nx) }) { Text("${playbackSpeed}x", fontWeight = FontWeight.Bold) }
+                                TextButton(onClick = { showAudioLabDialog = true }) {
+                                    val pitchLabel = if (pitchSemitones > 0) "+$pitchSemitones" else "$pitchSemitones"
+                                    Text("${playbackSpeed}x · Nada $pitchLabel", fontWeight = FontWeight.Bold, fontSize = 11.sp)
+                                }
                                 IconButton(onClick = { librarySubTab = LibrarySubTab.QUEUE; tab = LyraTab.LIBRARY }) { LyraVectorIcon(LyraIconType.QUEUE, tint = MaterialTheme.colorScheme.primary, size = 20.dp) }
                             }
                         }
                         Spacer(Modifier.height(4.dp))
                         if (!showFullKaraokeInPlayer) {
-                            Box(Modifier.fillMaxWidth().weight(0.40f).padding(horizontal = 12.dp, vertical = 4.dp).clip(RoundedCornerShape(28.dp)).background(Brush.linearGradient(listOf(Color(0xFF283A18), Color(0xFF151E0D), Color(0xFF0C1009)))).clickable { showFullKaraokeInPlayer = true }, contentAlignment = Alignment.Center) {
+                            Box(Modifier.fillMaxWidth().weight(0.38f).padding(horizontal = 12.dp, vertical = 4.dp).clip(RoundedCornerShape(28.dp)).background(Brush.linearGradient(listOf(Color(0xFF283A18), Color(0xFF151E0D), Color(0xFF0C1009)))).clickable { showFullKaraokeInPlayer = true }, contentAlignment = Alignment.Center) {
                                 if (currentTrack?.artworkUri != null) AsyncImage(model = currentTrack.artworkUri, contentDescription = null, modifier = Modifier.fillMaxSize(), contentScale = ContentScale.Crop)
-                                else Column(horizontalAlignment = Alignment.CenterHorizontally) { LyraBrandLogo(size = 104.dp, cornerRadius = 26.dp); Spacer(Modifier.height(8.dp)); Text(currentAlbum.ifBlank { "LYRA KARAOKE" }.uppercase(), color = Color(0xFFB8F36B), style = MaterialTheme.typography.labelMedium, fontWeight = FontWeight.Black) }
+                                else Column(horizontalAlignment = Alignment.CenterHorizontally) { LyraBrandLogo(size = 100.dp, cornerRadius = 26.dp); Spacer(Modifier.height(8.dp)); Text(currentAlbum.ifBlank { "LYRA KARAOKE" }.uppercase(), color = Color(0xFFB8F36B), style = MaterialTheme.typography.labelMedium, fontWeight = FontWeight.Black) }
                                 Surface(color = Color.Black.copy(alpha = 0.55f), shape = RoundedCornerShape(14.dp), modifier = Modifier.align(Alignment.BottomEnd).padding(10.dp)) { Text("Ketuk untuk Lirik Karaoke ♪", color = Color.White, style = MaterialTheme.typography.labelSmall, modifier = Modifier.padding(horizontal = 10.dp, vertical = 5.dp)) }
                             }
                             KaraokeMiniStage(parsedKaraokeLines, position, hasEnhancedKaraoke, autoWordKaraoke, { showFullKaraokeInPlayer = true }, { val (cT, cA) = cleanSearchQuery(currentTitle, currentArtist); searchTrack = cT; searchArtist = cA; lyricsSubTab = LyricsSubTab.SEARCH; tab = LyraTab.LYRICS; triggerManualLyricsSearch(cT, cA) })
                         } else {
-                            KaraokeFullStage(parsedKaraokeLines, position, hasEnhancedKaraoke, autoWordKaraoke, { autoWordKaraoke = !autoWordKaraoke; prefs.edit().putBoolean("auto_word_karaoke", autoWordKaraoke).apply() }, { ms -> controller?.seekTo(ms); position = ms }, { val (cT, cA) = cleanSearchQuery(currentTitle, currentArtist); searchTrack = cT; searchArtist = cA; lyricsSubTab = LyricsSubTab.SEARCH; tab = LyraTab.LYRICS; triggerManualLyricsSearch(cT, cA) }, Modifier.fillMaxWidth().weight(0.52f))
+                            KaraokeFullStage(parsedKaraokeLines, position, hasEnhancedKaraoke, autoWordKaraoke, { autoWordKaraoke = !autoWordKaraoke; prefs.edit().putBoolean("auto_word_karaoke", autoWordKaraoke).apply() }, { ms -> controller?.seekTo(ms); position = ms }, { val (cT, cA) = cleanSearchQuery(currentTitle, currentArtist); searchTrack = cT; searchArtist = cA; lyricsSubTab = LyricsSubTab.SEARCH; tab = LyraTab.LYRICS; triggerManualLyricsSearch(cT, cA) }, Modifier.fillMaxWidth().weight(0.50f))
                         }
                         Spacer(Modifier.height(6.dp))
                         Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
@@ -1058,20 +1253,50 @@ private fun LyraApp() {
                             Slider(value = position.coerceIn(0L, duration).toFloat(), onValueChange = { position = it.toLong() }, onValueChangeFinished = { controller?.seekTo(position) }, valueRange = 0f..duration.toFloat(), modifier = Modifier.height(24.dp))
                             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
                                 Text(formatTime(position), style = MaterialTheme.typography.labelSmall)
-                                Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                                // Baris A-B Loop Trainer & Lompat Cepat 10 Detik
+                                Row(horizontalArrangement = Arrangement.spacedBy(10.dp), verticalAlignment = Alignment.CenterVertically) {
                                     Text("↺ 10s", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.primary, modifier = Modifier.clickable { val t = (position - 10_000L).coerceAtLeast(0L); controller?.seekTo(t); position = t })
+                                    Surface(
+                                        shape = RoundedCornerShape(8.dp),
+                                        color = if (loopStartMs != null) MaterialTheme.colorScheme.primary.copy(alpha = 0.22f) else MaterialTheme.colorScheme.surfaceVariant,
+                                        modifier = Modifier.clickable {
+                                            when {
+                                                loopStartMs == null -> loopStartMs = position
+                                                loopEndMs == null && position > (loopStartMs ?: 0L) + 500L -> loopEndMs = position
+                                                else -> { loopStartMs = null; loopEndMs = null }
+                                            }
+                                        }
+                                    ) {
+                                        val loopText = when {
+                                            loopStartMs != null && loopEndMs != null -> "A-B Aktif (${formatTime(loopStartMs!!)}-${formatTime(loopEndMs!!)}) ✕"
+                                            loopStartMs != null -> "A: ${formatTime(loopStartMs!!)} → Set B"
+                                            else -> "Loop A-B"
+                                        }
+                                        Text(loopText, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.primary, fontWeight = FontWeight.Bold, modifier = Modifier.padding(horizontal = 8.dp, vertical = 2.dp))
+                                    }
                                     Text("10s ↻", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.primary, modifier = Modifier.clickable { val t = (position + 10_000L).coerceAtMost(duration); controller?.seekTo(t); position = t })
                                 }
                                 Text("−${formatTime((duration - position).coerceAtLeast(0L))}", style = MaterialTheme.typography.labelSmall)
                             }
                         }
-                        AudioVisualizer(audioSessionId = audioSessionId, isPlaying = playing, modifier = Modifier.fillMaxWidth().height(68.dp))
+                        AudioVisualizer(
+                            audioSessionId = audioSessionId,
+                            isPlaying = playing,
+                            style = visualizerStyle,
+                            onCycleStyle = {
+                                val all = VisualizerStyle.values()
+                                val next = all[(all.indexOf(visualizerStyle) + 1) % all.size]
+                                visualizerStyle = next
+                                prefs.edit().putString("visualizer_style", next.name).apply()
+                            },
+                            modifier = Modifier.fillMaxWidth().height(66.dp)
+                        )
                         Row(Modifier.fillMaxWidth().padding(vertical = 6.dp), horizontalArrangement = Arrangement.SpaceEvenly, verticalAlignment = Alignment.CenterVertically) {
                             Surface(shape = CircleShape, color = if (shuffle) MaterialTheme.colorScheme.primary.copy(alpha = 0.2f) else Color.Transparent, modifier = Modifier.size(44.dp).clickable { val ns = !(controller?.shuffleModeEnabled ?: false); controller?.shuffleModeEnabled = ns; shuffle = ns }) {
                                 Box(contentAlignment = Alignment.Center) { LyraVectorIcon(LyraIconType.SHUFFLE, tint = if (shuffle) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant, size = 22.dp) }
                             }
                             FilledTonalButton(onClick = { controller?.seekToPreviousMediaItem() }, modifier = Modifier.size(52.dp), shape = RoundedCornerShape(16.dp), contentPadding = PaddingValues(0.dp)) { LyraVectorIcon(LyraIconType.PREV, tint = Color.White, size = 22.dp) }
-                            Button(onClick = { if (playing) controller?.pause() else if (currentUri != null) controller?.play() else if (durationFilteredSongs.isNotEmpty()) playTracks(durationFilteredSongs, 0) }, modifier = Modifier.size(66.dp), shape = RoundedCornerShape(22.dp), contentPadding = PaddingValues(0.dp)) { LyraVectorIcon(if (playing) LyraIconType.PAUSE else LyraIconType.PLAY, tint = Color(0xFF0B0D0A), size = 28.dp) }
+                            Button(onClick = { if (playing) controller?.pause() else if (currentUri != null) controller?.play() else if (sortedAndFilteredSongs.isNotEmpty()) playTracks(sortedAndFilteredSongs, 0) }, modifier = Modifier.size(66.dp), shape = RoundedCornerShape(22.dp), contentPadding = PaddingValues(0.dp)) { LyraVectorIcon(if (playing) LyraIconType.PAUSE else LyraIconType.PLAY, tint = Color(0xFF0B0D0A), size = 28.dp) }
                             FilledTonalButton(onClick = { controller?.seekToNextMediaItem() }, modifier = Modifier.size(52.dp), shape = RoundedCornerShape(16.dp), contentPadding = PaddingValues(0.dp)) { LyraVectorIcon(LyraIconType.NEXT, tint = Color.White, size = 22.dp) }
                             Surface(shape = CircleShape, color = if (repeatMode != Player.REPEAT_MODE_OFF) MaterialTheme.colorScheme.primary.copy(alpha = 0.2f) else Color.Transparent, modifier = Modifier.size(44.dp).clickable { val nx = when (repeatMode) { Player.REPEAT_MODE_OFF -> Player.REPEAT_MODE_ALL; Player.REPEAT_MODE_ALL -> Player.REPEAT_MODE_ONE; else -> Player.REPEAT_MODE_OFF }; controller?.repeatMode = nx; repeatMode = nx }) {
                                 Box(contentAlignment = Alignment.Center) { LyraVectorIcon(when (repeatMode) { Player.REPEAT_MODE_ONE -> LyraIconType.REPEAT_ONE; Player.REPEAT_MODE_ALL -> LyraIconType.REPEAT_ALL; else -> LyraIconType.REPEAT_OFF }, tint = if (repeatMode != Player.REPEAT_MODE_OFF) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant, size = 22.dp) }
@@ -1098,7 +1323,7 @@ private fun LyraApp() {
                                 }
                                 val listToShow = if (librarySubTab == LibrarySubTab.FAVORITES) favoriteTracks else sortedAndFilteredSongs
                                 Row(Modifier.fillMaxWidth().padding(bottom = 4.dp), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
-                                    Text("${listToShow.size} lagu ditampilkan", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.secondary)
+                                    Text("${listToShow.size} lagu · ${sortOption.label}", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.secondary)
                                     TextButton(onClick = { if (listToShow.isNotEmpty()) playTracks(listToShow, 0) }, contentPadding = PaddingValues(horizontal = 8.dp, vertical = 0.dp)) { Text("▶ Putar Semua") }
                                 }
                                 TrackList(listToShow, currentUri, playing, favoriteIds, ::playTracks, ::toggleFavorite, { trackToAdd = it }, { openMetadataEditor(it) }, true, Modifier.weight(1f))
@@ -1142,7 +1367,7 @@ private fun LyraApp() {
                             LibrarySubTab.QUEUE -> {
                                 Spacer(Modifier.height(8.dp))
                                 Text("Antrean Pemutaran Saat Ini", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
-                                val queue = controller?.let { c -> (0 until c.mediaItemCount).mapNotNull { i -> val item = c.getMediaItemAt(i); val uri = item.localConfiguration?.uri ?: return@mapNotNull null; applyTrackOverride(AudioTrack(item.mediaId.ifBlank { uri.toString() }, uri, item.mediaMetadata.title?.toString() ?: "Audio", item.mediaMetadata.artist?.toString() ?: "Artis", item.mediaMetadata.albumTitle?.toString() ?: "", 0L)) } }.orEmpty()
+                                val queue = controller?.let { c -> (0 until c.mediaItemCount).mapNotNull { i -> val item = c.getMediaItemAt(i); val uri = item.localConfiguration?.uri ?: return@mapNotNull null; val matched = songs.firstOrNull { it.id == item.mediaId || it.uri == uri }; applyTrackOverride(AudioTrack(item.mediaId.ifBlank { uri.toString() }, uri, item.mediaMetadata.title?.toString() ?: "Audio", item.mediaMetadata.artist?.toString() ?: "Artis", item.mediaMetadata.albumTitle?.toString() ?: "", 0L, filePath = matched?.filePath.orEmpty())) } }.orEmpty()
                                 if (queue.isEmpty()) EmptyState("Antrean kosong", "Pilih lagu untuk mulai memutar.")
                                 else LazyColumn(Modifier.weight(1f)) {
                                     items(queue.indices.toList(), key = { queue[it].id + "_$it" }) { idx ->
@@ -1213,9 +1438,7 @@ private fun LyraApp() {
                                         items(results) { res ->
                                             val isSynced = !res.syncedLyrics.isNullOrBlank(); val isEnhanced = res.syncedLyrics?.contains("<") == true
                                             val previewLines = (res.syncedLyrics ?: res.plainLyrics.orEmpty()).lines().map { EnhancedLrcEngine.stripEnhancedTags(it.substringAfterLast("]")).trim() }.filter { it.isNotBlank() }.take(2).joinToString(" / ")
-                                            val nameStr = res.name.orEmpty()
-                                            val artistStr = res.artist.orEmpty()
-                                            val albumStr = res.album.orEmpty()
+                                            val nameStr = res.name.orEmpty(); val artistStr = res.artist.orEmpty(); val albumStr = res.album.orEmpty()
                                             ElevatedCard(onClick = { val chosen = res.syncedLyrics ?: res.plainLyrics.orEmpty(); lrcText = chosen; saveLrcToCache(chosen); lyricsStatus = "Lirik \"$nameStr\" disimpan"; lyricsSubTab = LyricsSubTab.PREVIEW }, shape = RoundedCornerShape(18.dp), colors = CardDefaults.elevatedCardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant)) {
                                                 Column(Modifier.fillMaxWidth().padding(14.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
                                                     Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.SpaceBetween, modifier = Modifier.fillMaxWidth()) {
@@ -1298,15 +1521,52 @@ private fun LyraApp() {
         }
     }
 
+    // Dialog Pitch & Speed Studio (Untuk Karaoke & Latihan Musik)
+    if (showAudioLabDialog) {
+        AlertDialog(
+            onDismissRequest = { showAudioLabDialog = false },
+            title = { Text("Studio Tempo & Nada (Pitch)") },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                    Text("Atur kecepatan lagu dan naik/turunkan nada dasar (semitone) untuk menyesuaikan tinggi suara karaoke Anda.", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    Text("Kecepatan Tempo: ${playbackSpeed}x", fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.primary)
+                    Row(Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                        listOf(0.75f, 0.9f, 1.0f, 1.15f, 1.25f, 1.5f).forEach { sp ->
+                            FilterChip(selected = playbackSpeed == sp, onClick = { playbackSpeed = sp; applyPlaybackParams(sp, pitchSemitones) }, label = { Text("${sp}x") })
+                        }
+                    }
+                    val pSign = if (pitchSemitones > 0) "+$pitchSemitones" else "$pitchSemitones"
+                    Text("Nada Dasar (Pitch): $pSign Semitone", fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.primary)
+                    Row(Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                        (-6..6).forEach { semi ->
+                            val lbl = if (semi > 0) "+$semi" else "$semi"
+                            FilterChip(selected = pitchSemitones == semi, onClick = { pitchSemitones = semi; applyPlaybackParams(playbackSpeed, semi) }, label = { Text(lbl) })
+                        }
+                    }
+                }
+            },
+            confirmButton = { Button(onClick = { showAudioLabDialog = false }) { Text("Selesai") } },
+            dismissButton = {
+                TextButton(onClick = {
+                    playbackSpeed = 1.0f; pitchSemitones = 0
+                    applyPlaybackParams(1.0f, 0)
+                    showAudioLabDialog = false
+                }) { Text("Reset Normal") }
+            }
+        )
+    }
+
+    // Dialog Edit Detail Lagu (Simpan Permanen 3 Lapis + Update MediaStore)
     if (showMetadataDialog) {
         val target = editingTrackTarget ?: currentTrack
         AlertDialog(
             onDismissRequest = { showMetadataDialog = false },
-            title = { Text("Edit Keterangan Lagu") },
+            title = { Text("Edit Permanen Detail Lagu") },
             text = {
                 Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                    Text("Perubahan nama penyanyi, judul, dan album akan disimpan secara permanen untuk lagu ini.", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.primary)
                     OutlinedTextField(editTitle, { editTitle = it }, label = { Text("Judul lagu") }, singleLine = true, modifier = Modifier.fillMaxWidth())
-                    OutlinedTextField(editArtist, { editArtist = it }, label = { Text("Artis") }, singleLine = true, modifier = Modifier.fillMaxWidth())
+                    OutlinedTextField(editArtist, { editArtist = it }, label = { Text("Penyanyi / Artis") }, singleLine = true, modifier = Modifier.fillMaxWidth())
                     OutlinedTextField(editAlbum, { editAlbum = it }, label = { Text("Album") }, singleLine = true, modifier = Modifier.fillMaxWidth())
                     Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                         OutlinedTextField(editArtworkUri, { editArtworkUri = it }, label = { Text("URI Sampul") }, singleLine = true, modifier = Modifier.weight(1f))
@@ -1319,20 +1579,77 @@ private fun LyraApp() {
                     val title = editTitle.trim().ifBlank { target?.title ?: currentTitle }
                     val artist = editArtist.trim().ifBlank { "Artis tidak diketahui" }
                     val album = editAlbum.trim().ifBlank { "Album tidak diketahui" }
-                    val ov = MetadataOverride(title, artist, album, editArtworkUri.trim())
+                    val artStr = editArtworkUri.trim()
+                    val ov = MetadataOverride(title, artist, album, artStr)
                     val updatedMap = metadataOverrides.toMutableMap()
-                    if (target != null) { updatedMap[target.id] = ov; updatedMap[target.uri.toString()] = ov } else if (currentUri != null) updatedMap[currentUri.toString()] = ov
-                    metadataOverrides = updatedMap; saveMetadataOverrides(prefs, updatedMap)
-                    songs = songs.map { s -> if ((target != null && (s.id == target.id || s.uri == target.uri)) || (target == null && s.uri == currentUri)) applyTrackOverride(s, updatedMap) else s }
+
+                    // Simpan ke 3 kunci (ID, URI, dan FilePath) agar 100% permanen
+                    if (target != null) {
+                        updatedMap[target.id] = ov
+                        updatedMap[target.uri.toString()] = ov
+                        if (target.filePath.isNotBlank()) updatedMap["path:${target.filePath}"] = ov
+                    }
+                    if (currentUri != null && (target == null || target.uri == currentUri)) {
+                        updatedMap[currentUri.toString()] = ov
+                    }
+
+                    metadataOverrides = updatedMap
+                    saveMetadataOverrides(prefs, updatedMap)
+
+                    // Coba tulis juga ke MediaStore Android jika diizinkan sistem
+                    val mediaUri = target?.uri ?: currentUri
+                    if (mediaUri != null && mediaUri.toString().startsWith("content://media/")) {
+                        scope.launch(Dispatchers.IO) {
+                            runCatching {
+                                val values = ContentValues().apply {
+                                    put(MediaStore.Audio.Media.TITLE, title)
+                                    put(MediaStore.Audio.Media.ARTIST, artist)
+                                    put(MediaStore.Audio.Media.ALBUM, album)
+                                }
+                                context.contentResolver.update(mediaUri, values, null, null)
+                            }
+                        }
+                    }
+
+                    // Perbarui daftar lagu di memori seketika
+                    songs = songs.map { s -> applyTrackOverride(s, updatedMap) }
+
+                    // Perbarui lagu yang sedang diputar dan item di MediaController
                     if (target == null || target.uri == currentUri) {
                         currentTitle = title; currentArtist = artist; currentAlbum = album
                         val (cT, cA) = cleanSearchQuery(title, artist); searchTrack = cT; searchArtist = cA
-                        prefs.edit().putString("current_title", title).putString("current_artist", artist).putString("current_album", album).apply()
+                        prefs.edit().putString("current_title", title).putString("current_artist", artist).putString("current_album", album).commit()
+
+                        val c = controller
+                        val idx = c?.currentMediaItemIndex ?: -1
+                        if (c != null && idx >= 0 && idx < c.mediaItemCount) {
+                            val oldItem = c.getMediaItemAt(idx)
+                            val artUri = artStr.takeIf { it.isNotBlank() }?.let { runCatching { Uri.parse(it) }.getOrNull() } ?: oldItem.mediaMetadata.artworkUri
+                            val newMeta = oldItem.mediaMetadata.buildUpon().setTitle(title).setArtist(artist).setAlbumTitle(album).setArtworkUri(artUri).build()
+                            c.replaceMediaItem(idx, oldItem.buildUpon().setMediaMetadata(newMeta).build())
+                        }
                     }
+                    status = "Detail lagu \"$title\" disimpan permanen."
                     showMetadataDialog = false
-                }) { Text("Simpan") }
+                }) { Text("Simpan Permanen") }
             },
-            dismissButton = { TextButton(onClick = { showMetadataDialog = false }) { Text("Batal") } }
+            dismissButton = {
+                Row {
+                    if (target != null) {
+                        TextButton(onClick = {
+                            val updatedMap = metadataOverrides.toMutableMap()
+                            updatedMap.remove(target.id)
+                            updatedMap.remove(target.uri.toString())
+                            if (target.filePath.isNotBlank()) updatedMap.remove("path:${target.filePath}")
+                            metadataOverrides = updatedMap
+                            saveMetadataOverrides(prefs, updatedMap)
+                            scanSongs()
+                            showMetadataDialog = false
+                        }) { Text("Reset") }
+                    }
+                    TextButton(onClick = { showMetadataDialog = false }) { Text("Batal") }
+                }
+            }
         )
     }
 
