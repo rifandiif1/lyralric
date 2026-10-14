@@ -3,9 +3,10 @@ package com.example.lyraplayer.playback
 import android.content.Intent
 import android.os.Handler
 import android.os.Looper
-import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.common.AudioAttributes
 import androidx.media3.common.C
+import androidx.media3.common.Player
+import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.session.MediaSession
 import androidx.media3.session.MediaSessionService
 import com.example.lyraplayer.lyrics.LrcParser
@@ -22,37 +23,55 @@ class PlaybackService : MediaSessionService() {
             val session = mediaSession
             if (session != null) {
                 val prefs = getSharedPreferences("lyra", MODE_PRIVATE)
+                val currentSessionId = session.player.audioSessionId
+                if (currentSessionId > 0 && prefs.getInt("audio_session_id", 0) != currentSessionId) {
+                    prefs.edit().putInt("audio_session_id", currentSessionId).apply()
+                }
                 val lrc = prefs.getString("current_lrc", "").orEmpty()
-                val lines = LrcParser.parse(lrc)
-                val lyric = LrcParser.displayLine(lrc, session.player.currentPosition)
+                // Bersihkan tag enhanced <mm:ss.xx> untuk tampilan widget
+                val rawLyric = LrcParser.displayLine(lrc, session.player.currentPosition)
+                val cleanLyric = rawLyric.replace(Regex("<\\d{1,2}:\\d{2}(?:[.:]\\d{1,3})?>"), "").trim()
                 val title = prefs.getString("current_title", "Lyra Player").orEmpty()
-                if (lyric != lastLyric || title != lastTitle) {
-                    lastLyric = lyric
+                if (cleanLyric != lastLyric || title != lastTitle) {
+                    lastLyric = cleanLyric
                     lastTitle = title
                     LyricsWidgetProvider.updateAll(
                         this@PlaybackService,
                         title,
-                        lyric.ifBlank { "Lirik belum tersedia" }
+                        cleanLyric.ifBlank { "Lirik belum tersedia" }
                     )
                 }
             }
-            handler.postDelayed(this, 500)
+            handler.postDelayed(this, 350)
         }
     }
 
     override fun onCreate() {
         super.onCreate()
+        val prefs = getSharedPreferences("lyra", MODE_PRIVATE)
         val player = ExoPlayer.Builder(this)
             .setAudioAttributes(
                 AudioAttributes.Builder()
-                    .setUsage(androidx.media3.common.C.USAGE_MEDIA)
-                    .setContentType(androidx.media3.common.C.AUDIO_CONTENT_TYPE_MUSIC)
+                    .setUsage(C.USAGE_MEDIA)
+                    .setContentType(C.AUDIO_CONTENT_TYPE_MUSIC)
                     .build(),
                 true
             )
             .setHandleAudioBecomingNoisy(true)
             .build()
-        getSharedPreferences("lyra", MODE_PRIVATE).edit().putInt("audio_session_id", player.audioSessionId).apply()
+
+        if (player.audioSessionId > 0) {
+            prefs.edit().putInt("audio_session_id", player.audioSessionId).apply()
+        }
+
+        player.addListener(object : Player.Listener {
+            override fun onAudioSessionIdChanged(audioSessionId: Int) {
+                if (audioSessionId > 0) {
+                    prefs.edit().putInt("audio_session_id", audioSessionId).apply()
+                }
+            }
+        })
+
         mediaSession = MediaSession.Builder(this, player).build()
         handler.post(lyricTicker)
     }
