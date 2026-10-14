@@ -158,7 +158,7 @@ private fun cleanSearchQuery(rawTitle: String, rawArtist: String): Pair<String, 
         val p = t.split(" - ", limit = 2)
         if (p.size == 2 && p[0].length in 2..40 && p[1].length >= 2) { a = p[0].trim(); t = p[1].trim() }
     } else if (a.isNotBlank() && t.lowercase(Locale.ROOT).startsWith(a.lowercase(Locale.ROOT) + " - ")) {
-        t = t.substring(a.length + 3).trim()
+        t = t.drop(a.length + 3).trim()
     }
     return Pair(t.ifBlank { rawTitle.trim() }, a)
 }
@@ -215,7 +215,6 @@ private fun loadMetadataOverrides(raw: String): Map<String, MetadataOverride> = 
     m
 }.getOrDefault(emptyMap())
 
-// commit() digunakan agar penyimpanan ke disk bersifat sinkron dan langsung permanen seketika
 private fun saveMetadataOverrides(prefs: SharedPreferences, map: Map<String, MetadataOverride>) {
     val root = JSONObject()
     for ((k, v) in map.entries) {
@@ -255,7 +254,7 @@ private object EnhancedLrcEngine {
             val tr = rawLine.trim(); if (tr.isBlank()) continue
             val pm = Regex("^(?:\\[\\d{1,2}:\\d{2}(?:[.:]\\d{1,3})?\\])+").find(tr)
             if (pm != null) {
-                val body = tr.substring(pm.value.length).trim()
+                val body = tr.drop(pm.value.length).trim()
                 for (m in lineTsRegex.findAll(pm.value)) rawEntries.add(Pair(toMs(m.groupValues[1], m.groupValues[2], m.groupValues.getOrNull(3)), body))
             }
         }
@@ -484,8 +483,8 @@ private fun KaraokeWordText(line: KaraokeLine, positionMs: Long, isCurrentLine: 
                 positionMs in word.startMs until word.endMs -> {
                     val dur = (word.endMs - word.startMs).coerceAtLeast(1L)
                     val splitIdx = (word.text.length * ((positionMs - word.startMs).toFloat() / dur.toFloat()).coerceIn(0f, 1f)).toInt().coerceIn(0, word.text.length)
-                    withStyle(SpanStyle(color = activeColor, fontWeight = FontWeight.Black)) { append(word.text.substring(0, splitIdx)) }
-                    withStyle(SpanStyle(color = activeColor.copy(alpha = 0.65f), fontWeight = FontWeight.ExtraBold)) { append(word.text.substring(splitIndex = splitIdx)) }
+                    withStyle(SpanStyle(color = activeColor, fontWeight = FontWeight.Black)) { append(word.text.take(splitIdx)) }
+                    withStyle(SpanStyle(color = activeColor.copy(alpha = 0.65f), fontWeight = FontWeight.ExtraBold)) { append(word.text.drop(splitIdx)) }
                 }
                 else -> withStyle(SpanStyle(color = unsungColor, fontWeight = FontWeight.Bold)) { append(word.text) }
             }
@@ -575,7 +574,6 @@ private fun EqualizerPanel(audioSessionId: Int) {
     }
     if (audioSessionId <= 0 || eq == null) { Text("Mulai putar lagu untuk mengaktifkan equalizer.", style = MaterialTheme.typography.bodySmall); return }
     Row(verticalAlignment = Alignment.CenterVertically) { Text("Equalizer Studio", Modifier.weight(1f), fontWeight = FontWeight.SemiBold); Switch(checked = enabled, onCheckedChange = { v -> enabled = v; runCatching { eq.enabled = v } }) }
-    // Preset Cepat Equalizer
     val presets = listOf(
         "Flat" to listOf(0f, 0f, 0f, 0f, 0f),
         "Bass+" to listOf(0.7f, 0.4f, 0f, 0.1f, 0.2f),
@@ -757,7 +755,6 @@ private fun LyraApp() {
     var visualizerStyle by remember { mutableStateOf(runCatching { VisualizerStyle.valueOf(prefs.getString("visualizer_style", VisualizerStyle.NEON_BARS.name).orEmpty()) }.getOrDefault(VisualizerStyle.NEON_BARS)) }
     var autoWordKaraoke by remember { mutableStateOf(prefs.getBoolean("auto_word_karaoke", true)) }
 
-    // Fitur Pitch (Semitone) & Speed Studio + A-B Repeat Loop
     var playbackSpeed by remember { mutableFloatStateOf(1.0f) }
     var pitchSemitones by remember { mutableIntStateOf(0) }
     var showAudioLabDialog by remember { mutableStateOf(false) }
@@ -836,7 +833,6 @@ private fun LyraApp() {
         }
     }
 
-    // Pencocokan 3 lapis (ID, URI, dan FilePath) agar edit detail lagu benar-benar permanen
     fun findOverrideFor(id: String, uriStr: String, filePath: String = "", overrides: Map<String, MetadataOverride> = metadataOverrides): MetadataOverride? {
         return overrides[id]
             ?: overrides[uriStr]
@@ -1035,7 +1031,6 @@ private fun LyraApp() {
             duration = c.duration.takeIf { it > 0 && it != androidx.media3.common.C.TIME_UNSET } ?: 0L
             shuffle = c.shuffleModeEnabled; repeatMode = c.repeatMode
 
-            // Eksekusi A-B Repeat Loop jika diaktifkan
             val lStart = loopStartMs; val lEnd = loopEndMs
             if (lStart != null && lEnd != null && lEnd > lStart + 500L && position >= lEnd) {
                 c.seekTo(lStart)
@@ -1086,7 +1081,6 @@ private fun LyraApp() {
         if (sleepMinutes > 0) { delay(sleepMinutes * 60_000L); controller?.pause(); sleepMinutes = 0; status = "Timer tidur selesai." }
     }
 
-    // Filter Durasi Minimal + Pencarian + Pengurutan (Termasuk Waktu Ditambahkan)
     val durationFilteredSongs = remember(songs, minDurationSec) {
         val minMs = minDurationSec * 1000L
         songs.filter { it.isSaf || it.duration == 0L || it.duration >= minMs }
@@ -1253,7 +1247,6 @@ private fun LyraApp() {
                             Slider(value = position.coerceIn(0L, duration).toFloat(), onValueChange = { position = it.toLong() }, onValueChangeFinished = { controller?.seekTo(position) }, valueRange = 0f..duration.toFloat(), modifier = Modifier.height(24.dp))
                             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
                                 Text(formatTime(position), style = MaterialTheme.typography.labelSmall)
-                                // Baris A-B Loop Trainer & Lompat Cepat 10 Detik
                                 Row(horizontalArrangement = Arrangement.spacedBy(10.dp), verticalAlignment = Alignment.CenterVertically) {
                                     Text("↺ 10s", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.primary, modifier = Modifier.clickable { val t = (position - 10_000L).coerceAtLeast(0L); controller?.seekTo(t); position = t })
                                     Surface(
@@ -1521,7 +1514,6 @@ private fun LyraApp() {
         }
     }
 
-    // Dialog Pitch & Speed Studio (Untuk Karaoke & Latihan Musik)
     if (showAudioLabDialog) {
         AlertDialog(
             onDismissRequest = { showAudioLabDialog = false },
@@ -1556,7 +1548,6 @@ private fun LyraApp() {
         )
     }
 
-    // Dialog Edit Detail Lagu (Simpan Permanen 3 Lapis + Update MediaStore)
     if (showMetadataDialog) {
         val target = editingTrackTarget ?: currentTrack
         AlertDialog(
@@ -1583,7 +1574,6 @@ private fun LyraApp() {
                     val ov = MetadataOverride(title, artist, album, artStr)
                     val updatedMap = metadataOverrides.toMutableMap()
 
-                    // Simpan ke 3 kunci (ID, URI, dan FilePath) agar 100% permanen
                     if (target != null) {
                         updatedMap[target.id] = ov
                         updatedMap[target.uri.toString()] = ov
@@ -1596,7 +1586,6 @@ private fun LyraApp() {
                     metadataOverrides = updatedMap
                     saveMetadataOverrides(prefs, updatedMap)
 
-                    // Coba tulis juga ke MediaStore Android jika diizinkan sistem
                     val mediaUri = target?.uri ?: currentUri
                     if (mediaUri != null && mediaUri.toString().startsWith("content://media/")) {
                         scope.launch(Dispatchers.IO) {
@@ -1611,10 +1600,8 @@ private fun LyraApp() {
                         }
                     }
 
-                    // Perbarui daftar lagu di memori seketika
                     songs = songs.map { s -> applyTrackOverride(s, updatedMap) }
 
-                    // Perbarui lagu yang sedang diputar dan item di MediaController
                     if (target == null || target.uri == currentUri) {
                         currentTitle = title; currentArtist = artist; currentAlbum = album
                         val (cT, cA) = cleanSearchQuery(title, artist); searchTrack = cT; searchArtist = cA
